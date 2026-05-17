@@ -1588,7 +1588,11 @@ fn build_handler_card(
             down_btn.connect_clicked(move |_| {
                 {
                     let mut cfg = config.borrow_mut();
-                    cfg.handlers.swap(i, i + 1);
+                    if i + 1 < cfg.handlers.len() {
+                        cfg.handlers.swap(i, i + 1);
+                    } else {
+                        return;
+                    }
                 }
                 let _ = crate::config::save(&config.borrow());
                 rebuild_handler_cards(&cards_box, &config, &apps);
@@ -1769,16 +1773,15 @@ fn build_handler_card(
                 let mut invalid = false;
                 let mut child = regex_box.first_child();
                 while let Some(w) = child {
-                    if let Some(row) = w.downcast_ref::<gtk4::Box>() {
-                        if let Some(entry) = row
+                    if let Some(row) = w.downcast_ref::<gtk4::Box>()
+                        && let Some(entry) = row
                             .first_child()
                             .and_then(|c| c.downcast::<gtk4::Entry>().ok())
-                        {
-                            let t = entry.text();
-                            if !t.is_empty() && regex::Regex::new(t.as_str()).is_err() {
-                                invalid = true;
-                                break;
-                            }
+                    {
+                        let t = entry.text();
+                        if !t.is_empty() && regex::Regex::new(t.as_str()).is_err() {
+                            invalid = true;
+                            break;
                         }
                     }
                     child = w.next_sibling();
@@ -1806,7 +1809,7 @@ fn build_handler_card(
 
             let new_handler = crate::config::RegexHandler {
                 regexes,
-                exec: exec.clone(),
+                exec,
                 terminal: terminal_check.is_active(),
             };
 
@@ -1876,15 +1879,14 @@ fn collect_regexes(regex_box: &gtk4::Box) -> Vec<String> {
     let mut out = Vec::new();
     let mut child = regex_box.first_child();
     while let Some(w) = child {
-        if let Some(row) = w.downcast_ref::<gtk4::Box>() {
-            if let Some(entry) = row
+        if let Some(row) = w.downcast_ref::<gtk4::Box>()
+            && let Some(entry) = row
                 .first_child()
                 .and_then(|c| c.downcast::<gtk4::Entry>().ok())
-            {
-                let t = entry.text().trim().to_string();
-                if !t.is_empty() {
-                    out.push(t);
-                }
+        {
+            let t = entry.text().trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
             }
         }
         child = w.next_sibling();
