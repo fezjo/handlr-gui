@@ -211,6 +211,7 @@ pub(crate) fn build_window(
     }
 
     let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_overlay_scrolling(false);
     scrolled.set_child(Some(&list_view));
     stack.add_named(&scrolled, Some("tree"));
 
