@@ -213,7 +213,7 @@ pub(crate) fn build_window(
     // Wrap inner stack in a named page of main_tabs.
     main_tabs.add_titled(&stack, Some("defaults"), "Defaults");
 
-    let regex_tab = build_regex_handlers_tab(config.clone(), state.clone());
+    let (regex_tab, refresh_handlers) = build_regex_handlers_tab(config.clone(), state.clone());
     main_tabs.add_titled(&regex_tab, Some("regex-handlers"), "Regex Handlers");
 
     vbox.append(&main_tabs);
@@ -224,13 +224,22 @@ pub(crate) fn build_window(
     // Reload.
     {
         let wiring = wiring.clone();
+        let config = config.clone();
         reload_btn.connect_clicked(move |_| match handlr::list_all() {
             Ok(s) => {
                 wiring.state.borrow_mut().set_state(s);
+                if let Ok(new_cfg) = crate::config::load() {
+                    *config.borrow_mut() = new_cfg;
+                }
+                refresh_handlers();
                 refresh_view(&wiring);
                 hide_banner(&wiring.revealer);
             }
-            Err(e) => show_error(&wiring.revealer, &wiring.info_label, &format!("Reload failed: {}", e)),
+            Err(e) => show_error(
+                &wiring.revealer,
+                &wiring.info_label,
+                &format!("Reload failed: {}", e),
+            ),
         });
     }
 
@@ -1416,7 +1425,7 @@ fn entry_row(title: &str, subtitle: &str, entry: &gtk4::Entry) -> gtk4::ListBoxR
 pub(crate) fn build_regex_handlers_tab(
     config: Rc<RefCell<crate::config::Config>>,
     state: Rc<RefCell<AppState>>,
-) -> gtk4::Widget {
+) -> (gtk4::Widget, impl Fn() + 'static) {
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     // Toolbar row.
@@ -1481,7 +1490,23 @@ pub(crate) fn build_regex_handlers_tab(
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    outer.upcast()
+    let refresh = {
+        let cards_box = cards_box.clone();
+        let config = config.clone();
+        let state = state.clone();
+        move || {
+            let apps: Vec<handlr::App> = state
+                .borrow()
+                .state()
+                .system_apps
+                .iter()
+                .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+                .collect();
+            rebuild_handler_cards(&cards_box, &config, &apps);
+        }
+    };
+
+    (outer.upcast(), refresh)
 }
 
 fn rebuild_handler_cards(

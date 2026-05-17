@@ -2,6 +2,8 @@
 //! `gio::spawn_blocking` to keep the main loop responsive.
 
 use anyhow::{Result, anyhow};
+use gtk4::gio;
+use gtk4::prelude::AppInfoExt;
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
@@ -117,7 +119,9 @@ fn map_state(raw: RawListAll) -> State {
     for entry in raw.system_apps {
         for desktop in entry.handlers {
             if seen.insert(desktop.clone()) {
-                let name = humanize(&desktop);
+                let name = gio::DesktopAppInfo::new(&desktop)
+                    .map(|info| info.name().to_string())
+                    .unwrap_or_else(|| humanize(&desktop));
                 system_apps.push(App { desktop, name });
             }
         }
@@ -195,10 +199,10 @@ mod tests {
             .iter()
             .find(|a| a.desktop == "org.gnome.TextEditor.desktop")
             .unwrap();
-        assert_eq!(textedit.name, "TextEditor");
+        assert!(!textedit.name.is_empty());
 
         let mpv = state.system_apps.iter().find(|a| a.desktop == "mpv.desktop").unwrap();
-        assert_eq!(mpv.name, "Mpv");
+        assert!(!mpv.name.is_empty());
     }
 
     #[test]
