@@ -216,6 +216,9 @@ pub(crate) fn build_window(
     let (regex_tab, refresh_handlers) = build_regex_handlers_tab(config.clone(), state.clone());
     main_tabs.add_titled(&regex_tab, Some("regex-handlers"), "Regex Handlers");
 
+    let tester_tab = build_tester_tab(config.clone(), state.clone());
+    main_tabs.add_titled(&tester_tab, Some("tester"), "Tester");
+
     vbox.append(&main_tabs);
 
     // Initial population + header sensitivity.
@@ -1974,6 +1977,330 @@ fn resolve_app_icon(exec: &str, apps: &[handlr::App]) -> Option<gio::Icon> {
         }
     }
     None
+}
+
+// --- Tester tab -----------------------------------------------------------------------
+
+struct RegexAttempt {
+    handler_display: String,
+    pattern: String,
+    matched: bool,
+}
+
+enum ResolutionKind {
+    Regex { handler_idx: usize, pattern: String },
+    MimeDefault { mime: String },
+    NoHandler { mime: Option<String> },
+}
+
+struct Resolution {
+    kind: ResolutionKind,
+    display_name: String,
+    icon: Option<gio::Icon>,
+    regex_attempts: Vec<RegexAttempt>,
+    detected_mime: Option<String>,
+}
+
+fn looks_like_mime(s: &str) -> bool {
+    !s.contains("://")
+        && !s.starts_with('/')
+        && !s.starts_with('~')
+        && s.contains('/')
+        && !s.contains(' ')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || ".-+_/".contains(c))
+}
+
+fn resolve_input(
+    input: &str,
+    config: &crate::config::Config,
+    state: &handlr::State,
+    apps: &[handlr::App],
+) -> Resolution {
+    let mut regex_attempts = Vec::new();
+
+    // 1. Try regex handlers against raw input string.
+    for (idx, handler) in config.handlers.iter().enumerate() {
+        let handler_display = resolve_exec_name(&handler.exec, apps);
+        for pattern in &handler.regexes {
+            let matched = regex::Regex::new(pattern)
+                .map(|re| re.is_match(input))
+                .unwrap_or(false);
+            regex_attempts.push(RegexAttempt {
+                handler_display: handler_display.clone(),
+                pattern: pattern.clone(),
+                matched,
+            });
+            if matched {
+                return Resolution {
+                    kind: ResolutionKind::Regex { handler_idx: idx, pattern: pattern.clone() },
+                    display_name: handler_display,
+                    icon: resolve_app_icon(&handler.exec, apps),
+                    regex_attempts,
+                    detected_mime: None,
+                };
+            }
+        }
+    }
+
+    // 2. Determine MIME type.
+    let mime = if looks_like_mime(input) {
+        Some(input.to_string())
+    } else {
+        handlr::detect_mime_str(input).ok()
+    };
+
+    // 3. Look up MIME in defaults.
+    if let Some(ref m) = mime
+        && let Some((_, handlers)) = state.defaults.iter().find(|(dm, _)| dm == m)
+        && let Some(desktop) = handlers.first()
+    {
+        let display_name = apps
+            .iter()
+            .find(|a| &a.desktop == desktop)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| desktop.clone());
+        let icon = gio::DesktopAppInfo::new(desktop).and_then(|i| i.icon());
+        return Resolution {
+            kind: ResolutionKind::MimeDefault { mime: m.clone() },
+            display_name,
+            icon,
+            regex_attempts,
+            detected_mime: mime,
+        };
+    }
+
+    Resolution {
+        kind: ResolutionKind::NoHandler { mime: mime.clone() },
+        display_name: String::new(),
+        icon: None,
+        regex_attempts,
+        detected_mime: mime,
+    }
+}
+
+fn build_resolution_display(
+    results_box: &gtk4::Box,
+    resolution: &Resolution,
+) {
+    // Winner card.
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    card.add_css_class("card");
+    card.set_margin_top(4);
+
+    let winner_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    winner_row.set_margin_top(10);
+    winner_row.set_margin_bottom(6);
+    winner_row.set_margin_start(12);
+    winner_row.set_margin_end(12);
+
+    match &resolution.kind {
+        ResolutionKind::NoHandler { .. } => {
+            let label = gtk4::Label::new(Some("No handler found"));
+            label.add_css_class("dim-label");
+            winner_row.append(&label);
+        }
+        _ => {
+            if let Some(icon) = &resolution.icon {
+                let img = gtk4::Image::new();
+                img.set_from_gicon(icon);
+                img.set_pixel_size(32);
+                winner_row.append(&img);
+            }
+            let name_label = gtk4::Label::new(Some(&resolution.display_name));
+            name_label.add_css_class("title-3");
+            winner_row.append(&name_label);
+        }
+    }
+    card.append(&winner_row);
+
+    // Reason row.
+    let reason_text = match &resolution.kind {
+        ResolutionKind::Regex { handler_idx, pattern } => {
+            format!("Matched regex handler #{} — pattern: {}", handler_idx + 1, pattern)
+        }
+        ResolutionKind::MimeDefault { mime } => {
+            format!("Default handler for MIME type {}", mime)
+        }
+        ResolutionKind::NoHandler { mime } => {
+            if let Some(m) = mime {
+                format!("No handler configured for MIME type {}", m)
+            } else {
+                "Could not determine MIME type".to_string()
+            }
+        }
+    };
+    let reason_label = gtk4::Label::new(Some(&reason_text));
+    reason_label.add_css_class("dim-label");
+    reason_label.set_halign(gtk4::Align::Start);
+    reason_label.set_margin_start(12);
+    reason_label.set_margin_bottom(8);
+    reason_label.set_wrap(true);
+    card.append(&reason_label);
+
+    // Detected MIME badge (when different from the match source).
+    if let Some(mime) = &resolution.detected_mime {
+        let show_badge = match &resolution.kind {
+            ResolutionKind::MimeDefault { mime: m } => m != mime,
+            _ => true,
+        };
+        if show_badge {
+            let mime_label = gtk4::Label::new(Some(&format!("Detected MIME: {}", mime)));
+            mime_label.add_css_class("dim-label");
+            mime_label.set_halign(gtk4::Align::Start);
+            mime_label.set_margin_start(12);
+            mime_label.set_margin_bottom(8);
+            card.append(&mime_label);
+        }
+    }
+
+    results_box.append(&card);
+
+    // Resolution chain (only if there were regex attempts).
+    if !resolution.regex_attempts.is_empty() {
+        let chain_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        chain_box.set_margin_top(8);
+
+        let chain_header = gtk4::Label::new(Some("Resolution chain"));
+        chain_header.add_css_class("heading");
+        chain_header.set_halign(gtk4::Align::Start);
+        chain_box.append(&chain_header);
+
+        for attempt in &resolution.regex_attempts {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            row.set_margin_top(2);
+
+            let tick = gtk4::Label::new(Some(if attempt.matched { "✓" } else { "✗" }));
+            if attempt.matched {
+                tick.add_css_class("success");
+            } else {
+                tick.add_css_class("dim-label");
+            }
+            row.append(&tick);
+
+            let desc = gtk4::Label::new(Some(&format!(
+                "{}: {}",
+                attempt.handler_display, attempt.pattern
+            )));
+            desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            desc.set_hexpand(true);
+            desc.set_xalign(0.0);
+            if !attempt.matched {
+                desc.add_css_class("dim-label");
+            }
+            row.append(&desc);
+
+            let result_label = gtk4::Label::new(Some(if attempt.matched { "matched" } else { "no match" }));
+            if attempt.matched {
+                result_label.add_css_class("success");
+            } else {
+                result_label.add_css_class("dim-label");
+            }
+            row.append(&result_label);
+
+            chain_box.append(&row);
+        }
+
+        // If we fell through to MIME, show what the MIME fallback is.
+        if !matches!(&resolution.kind, ResolutionKind::Regex { .. })
+            && let Some(mime) = &resolution.detected_mime
+        {
+            let fallback_label = gtk4::Label::new(Some(&format!(
+                "→ Fell through to MIME: {}",
+                mime
+            )));
+            fallback_label.add_css_class("dim-label");
+            fallback_label.set_halign(gtk4::Align::Start);
+            fallback_label.set_margin_top(4);
+            chain_box.append(&fallback_label);
+        }
+
+        results_box.append(&chain_box);
+    }
+}
+
+pub(crate) fn build_tester_tab(
+    config: Rc<RefCell<crate::config::Config>>,
+    state: Rc<RefCell<AppState>>,
+) -> gtk4::Widget {
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    scrolled.set_child(Some(&inner));
+    outer.append(&scrolled);
+
+    // Input entry.
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some(
+        "Drop a file or type a URL, file path, or MIME type…",
+    ));
+    entry.set_hexpand(true);
+    inner.append(&entry);
+
+    // Drag-and-drop: accept files dropped onto the entry.
+    let drop_target = gtk4::DropTarget::builder()
+        .actions(gdk::DragAction::COPY)
+        .build();
+    drop_target.set_types(&[gdk::FileList::static_type()]);
+    {
+        let entry = entry.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            if let Ok(list) = value.get::<gdk::FileList>()
+                && let Some(file) = list.files().into_iter().next()
+            {
+                let text = file
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.uri().to_string());
+                entry.set_text(&text);
+                return true;
+            }
+            false
+        });
+    }
+    entry.add_controller(drop_target);
+
+    // Results area.
+    let results_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    inner.append(&results_box);
+
+    // Real-time resolution on each keystroke.
+    {
+        let config = config.clone();
+        let state = state.clone();
+        let results_box = results_box.clone();
+        entry.connect_changed(move |e| {
+            let text = e.text().trim().to_string();
+            while let Some(child) = results_box.first_child() {
+                results_box.remove(&child);
+            }
+            if text.is_empty() {
+                return;
+            }
+            let apps: Vec<handlr::App> = state
+                .borrow()
+                .state()
+                .system_apps
+                .iter()
+                .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+                .collect();
+            let cfg = config.borrow();
+            let st = state.borrow();
+            let resolution = resolve_input(&text, &cfg, st.state(), &apps);
+            drop(st);
+            drop(cfg);
+            build_resolution_display(&results_box, &resolution);
+        });
+    }
+
+    outer.upcast()
 }
 
 fn collect_regexes(regex_box: &gtk4::Box) -> Vec<String> {

@@ -80,6 +80,20 @@ pub(crate) fn detect_mime(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("handlr mime returned empty array"))
 }
 
+pub(crate) fn detect_mime_str(input: &str) -> Result<String> {
+    let out = Command::new("handlr")
+        .args(["mime", "--json", input])
+        .output()?;
+    if !out.status.success() {
+        return Err(anyhow!("handlr mime failed: {}", stderr(&out.stderr)));
+    }
+    let raw: Vec<RawMime> = serde_json::from_slice(&out.stdout)?;
+    raw.into_iter()
+        .next()
+        .map(|r| r.mime)
+        .ok_or_else(|| anyhow!("handlr mime returned empty array"))
+}
+
 pub(crate) fn run(cmd: &HandlrCmd) -> Result<()> {
     let (sub, args) = match cmd {
         HandlrCmd::Set { mime, desktop } => ("set", vec![mime.as_str(), desktop.as_str()]),
