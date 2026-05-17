@@ -24,24 +24,26 @@ impl Default for Config {
     }
 }
 
-fn config_path() -> PathBuf {
-    dirs_next_or_manual()
-        .join("handlr")
-        .join("handlr.toml")
+fn config_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
+    if home.is_empty() {
+        anyhow::bail!("HOME environment variable is empty");
+    }
+    Ok(PathBuf::from(home).join(".config"))
 }
 
-fn dirs_next_or_manual() -> PathBuf {
-    // XDG_CONFIG_HOME or ~/.config
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(p);
-    }
-    let mut home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    home.push(".config");
-    home
+fn config_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("handlr").join("handlr.toml"))
 }
 
 pub(crate) fn load() -> anyhow::Result<Config> {
-    let path = config_path();
+    let path = config_path()?;
     if !path.exists() {
         return Ok(Config::default());
     }
@@ -68,7 +70,7 @@ pub(crate) fn load() -> anyhow::Result<Config> {
 }
 
 pub(crate) fn save(cfg: &Config) -> anyhow::Result<()> {
-    let path = config_path();
+    let path = config_path()?;
     // Read existing doc so [[handlers]] is preserved; start fresh if absent.
     let mut doc: DocumentMut = if path.exists() {
         std::fs::read_to_string(&path)
