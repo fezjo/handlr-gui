@@ -11,6 +11,7 @@ pub(crate) struct Config {
     pub selector: String,
     pub term_exec_args: String,
     pub expand_wildcards: bool,
+    pub handlers: Vec<RegexHandler>,
 }
 
 impl Default for Config {
@@ -20,8 +21,16 @@ impl Default for Config {
             selector: String::new(),
             term_exec_args: "-e".into(),
             expand_wildcards: false,
+            handlers: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegexHandler {
+    pub regexes: Vec<String>,
+    pub exec: String,
+    pub terminal: bool,
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {
@@ -73,6 +82,31 @@ fn load_from(path: &Path) -> anyhow::Result<Config> {
     if let Some(v) = doc.get("expand_wildcards").and_then(Item::as_bool) {
         cfg.expand_wildcards = v;
     }
+    if let Some(aot) = doc.get("handlers").and_then(Item::as_array_of_tables) {
+        for t in aot {
+            let regexes: Vec<String> = t
+                .get("regexes")
+                .and_then(Item::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let exec = t
+                .get("exec")
+                .and_then(Item::as_str)
+                .unwrap_or("")
+                .to_string();
+            let terminal = t
+                .get("terminal")
+                .and_then(Item::as_bool)
+                .unwrap_or(false);
+            if !regexes.is_empty() || !exec.is_empty() {
+                cfg.handlers.push(RegexHandler { regexes, exec, terminal });
+            }
+        }
+    }
     Ok(cfg)
 }
 
@@ -90,6 +124,27 @@ fn save_to(cfg: &Config, path: &Path) -> anyhow::Result<()> {
     doc["selector"] = value(cfg.selector.as_str());
     doc["term_exec_args"] = value(cfg.term_exec_args.as_str());
     doc["expand_wildcards"] = value(cfg.expand_wildcards);
+
+    // Rebuild [[handlers]] array-of-tables from cfg.handlers.
+    doc.remove("handlers");
+    if !cfg.handlers.is_empty() {
+        let mut aot = toml_edit::ArrayOfTables::new();
+        for h in &cfg.handlers {
+            let mut t = toml_edit::Table::new();
+            let mut regexes_arr = toml_edit::Array::new();
+            for r in &h.regexes {
+                regexes_arr.push(r.as_str());
+            }
+            t.insert(
+                "regexes",
+                toml_edit::Item::Value(toml_edit::Value::Array(regexes_arr)),
+            );
+            t.insert("exec", toml_edit::value(h.exec.as_str()));
+            t.insert("terminal", toml_edit::value(h.terminal));
+            aot.push(t);
+        }
+        doc["handlers"] = toml_edit::Item::ArrayOfTables(aot);
+    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -111,6 +166,7 @@ mod tests {
         assert_eq!(cfg.term_exec_args, "-e");
         assert!(!cfg.expand_wildcards);
         assert!(cfg.selector.is_empty());
+        assert!(cfg.handlers.is_empty());
     }
 
     #[test]
@@ -123,6 +179,11 @@ mod tests {
             selector: "fzf".into(),
             term_exec_args: "-e".into(),
             expand_wildcards: true,
+            handlers: vec![RegexHandler {
+                regexes: vec!["https://youtu\\.be/.*".into()],
+                exec: "freetube %u".into(),
+                terminal: false,
+            }],
         };
         save_to(&cfg, &path).unwrap();
 
@@ -131,34 +192,69 @@ mod tests {
         assert_eq!(loaded.selector, cfg.selector);
         assert_eq!(loaded.term_exec_args, cfg.term_exec_args);
         assert_eq!(loaded.expand_wildcards, cfg.expand_wildcards);
+        assert_eq!(loaded.handlers.len(), 1);
+        assert_eq!(loaded.handlers[0].regexes, cfg.handlers[0].regexes);
+        assert_eq!(loaded.handlers[0].exec, cfg.handlers[0].exec);
+        assert_eq!(loaded.handlers[0].terminal, cfg.handlers[0].terminal);
     }
 
     #[test]
-    fn save_preserves_handlers_section() {
+    fn handlers_round_trip_multiple() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("handlr.toml");
-        std::fs::write(
-            &path,
-            "enable_selector = false\n\n[[handlers]]\nregex = 'https?://'\nhandler = 'firefox.desktop'\n",
-        )
-        .unwrap();
 
-        let mut cfg = load_from(&path).unwrap();
-        cfg.enable_selector = true;
+        let cfg = Config {
+            handlers: vec![
+                RegexHandler {
+                    regexes: vec!["https://youtu\\.be/.*".into(), "https://youtube\\.com/.*".into()],
+                    exec: "freetube %u".into(),
+                    terminal: false,
+                },
+                RegexHandler {
+                    regexes: vec!["magnet:.*".into()],
+                    exec: "transmission-gtk %u".into(),
+                    terminal: false,
+                },
+            ],
+            ..Default::default()
+        };
         save_to(&cfg, &path).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.handlers.len(), 2);
+        assert_eq!(loaded.handlers[0].regexes.len(), 2);
+        assert_eq!(loaded.handlers[1].exec, "transmission-gtk %u");
+    }
+
+    #[test]
+    fn handlers_empty_vec_removes_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handlr.toml");
+
+        // Write a file with handlers, then save with empty list.
+        let with_handlers = Config {
+            handlers: vec![RegexHandler {
+                regexes: vec!["https://.*".into()],
+                exec: "firefox %u".into(),
+                terminal: false,
+            }],
+            ..Default::default()
+        };
+        save_to(&with_handlers, &path).unwrap();
+
+        let empty = Config { handlers: vec![], ..Default::default() };
+        save_to(&empty, &path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[[handlers]]"), "handlers section must be preserved");
-        assert!(text.contains("enable_selector = true"));
+        assert!(!text.contains("[[handlers]]"), "handlers section should be absent");
     }
 
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("handlr.toml");
-        // No file created — load must succeed with defaults.
         let cfg = load_from(&path).unwrap();
         assert!(!cfg.enable_selector);
         assert_eq!(cfg.term_exec_args, "-e");
+        assert!(cfg.handlers.is_empty());
     }
 }
