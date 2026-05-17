@@ -674,7 +674,6 @@ fn build_list_view(
 
     let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
     list_view.add_css_class("defaults-list");
-    list_view.set_show_separators(true);
     (list_view, factory)
 }
 
@@ -837,14 +836,18 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
     };
     clear_actions(&w.actions);
 
-    // Reset colour classes from any previous bind before applying the right one.
+    // Reset all per-row-type CSS classes from the expander before rebinding.
+    for cls in ["row-category", "row-exception", "row-handler-alt", "row-add-exception"] {
+        expander.remove_css_class(cls);
+    }
     w.main_label.remove_css_class("mime-category");
     w.main_label.remove_css_class("mime-exception");
 
     match row_obj.row() {
         Row::Category { mime, handlers } => {
+            expander.add_css_class("row-category");
             w.main_icon.set_visible(true);
-            set_mime_icon(&w.main_icon, &strip_wildcard(&mime));
+            set_category_icon(&w.main_icon, &mime);
             w.main_label.set_text(&mime);
             w.main_label.add_css_class("mime-category");
             set_handler_inline(
@@ -890,6 +893,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                 }));
         }
         Row::Exception { mime, handlers } => {
+            expander.add_css_class("row-exception");
             w.main_icon.set_visible(true);
             set_mime_icon(&w.main_icon, &mime);
             w.main_label.set_text(&mime);
@@ -952,6 +956,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             index,
             ..
         } => {
+            expander.add_css_class("row-handler-alt");
             let info = gio::DesktopAppInfo::new(&desktop);
             // Left side empty — app appears on the right to match the default handler position.
             w.main_icon.set_visible(false);
@@ -997,6 +1002,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             }
         }
         Row::AddException { category_mime } => {
+            expander.add_css_class("row-add-exception");
             w.main_icon.set_visible(false);
             w.main_label.set_text("");
             w.handler_icon.set_visible(false);
@@ -1112,8 +1118,22 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
          }\
          .error-banner-icon { color: @error_color; }\
          \
-         /* Extra breathing room in tree rows. */\
+         /* Tree row rhythm: group categories with their children. */\
          .defaults-list row { min-height: 36px; }\
+         .defaults-list .row-category {\
+             padding-top: 6px;\
+             border-top: 1px solid alpha(currentColor, 0.10);\
+         }\
+         .defaults-list .row-exception {\
+             border-bottom: 1px solid alpha(currentColor, 0.06);\
+         }\
+         .defaults-list .row-handler-alt {\
+             background-color: alpha(@accent_color, 0.05);\
+             border-bottom: 1px solid alpha(currentColor, 0.06);\
+         }\
+         .defaults-list .row-add-exception {\
+             padding-bottom: 6px;\
+         }\
          \
          /* Ensure handler cards always have a visible border across all themes. */\
          .card {\
@@ -1136,6 +1156,26 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
 fn set_mime_icon(image: &gtk4::Image, mime: &str) {
     let icon = gio::functions::content_type_get_icon(mime);
     image.set_from_gicon(&icon);
+}
+
+// Named symbolic icons for the 7 seed categories. content_type_get_icon on wildcard
+// types (e.g. "x-scheme-handler/x-generic") often resolves to a blank rectangle
+// because no theme defines an icon for those pseudo-types.
+fn set_category_icon(image: &gtk4::Image, category_mime: &str) {
+    let name = match category_mime {
+        "audio/*" => "audio-x-generic-symbolic",
+        "video/*" => "video-x-generic-symbolic",
+        "image/*" => "image-x-generic-symbolic",
+        "text/*" => "text-x-generic-symbolic",
+        "application/*" => "application-x-executable-symbolic",
+        "inode/*" => "folder-symbolic",
+        "x-scheme-handler/*" => "web-browser-symbolic",
+        _ => {
+            set_mime_icon(image, &strip_wildcard(category_mime));
+            return;
+        }
+    };
+    image.set_icon_name(Some(name));
 }
 
 fn strip_wildcard(mime: &str) -> String {
