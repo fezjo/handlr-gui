@@ -2,7 +2,7 @@
 //! Uses toml_edit so existing [[handlers]] entries are not clobbered.
 
 use anyhow::Context;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut, Item};
 
 #[derive(Debug, Clone)]
@@ -43,12 +43,19 @@ fn config_path() -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn load() -> anyhow::Result<Config> {
-    let path = config_path()?;
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    load_from(&config_path()?)
+}
+
+pub(crate) fn save(cfg: &Config) -> anyhow::Result<()> {
+    save_to(cfg, &config_path()?)
+}
+
+fn load_from(path: &Path) -> anyhow::Result<Config> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let doc: DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
@@ -69,16 +76,14 @@ pub(crate) fn load() -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
-pub(crate) fn save(cfg: &Config) -> anyhow::Result<()> {
-    let path = config_path()?;
+fn save_to(cfg: &Config, path: &Path) -> anyhow::Result<()> {
     // Read existing doc so [[handlers]] is preserved; start fresh if absent.
-    let mut doc: DocumentMut = if path.exists() {
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?
+    let mut doc: DocumentMut = match std::fs::read_to_string(path) {
+        Ok(t) => t
             .parse()
-            .with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        DocumentMut::new()
+            .with_context(|| format!("parsing {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
     doc["enable_selector"] = value(cfg.enable_selector);
@@ -90,7 +95,7 @@ pub(crate) fn save(cfg: &Config) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating dir {}", parent.display()))?;
     }
-    std::fs::write(&path, doc.to_string())
+    std::fs::write(path, doc.to_string())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -111,9 +116,7 @@ mod tests {
     #[test]
     fn round_trip_save_load() {
         let dir = tempfile::tempdir().unwrap();
-        // Override config path by temporarily setting XDG_CONFIG_HOME
-        // SAFETY: single-threaded test (run with --test-threads=1)
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let path = dir.path().join("handlr.toml");
 
         let cfg = Config {
             enable_selector: true,
@@ -121,54 +124,41 @@ mod tests {
             term_exec_args: "-e".into(),
             expand_wildcards: true,
         };
-        save(&cfg).unwrap();
+        save_to(&cfg, &path).unwrap();
 
-        let loaded = load().unwrap();
+        let loaded = load_from(&path).unwrap();
         assert_eq!(loaded.enable_selector, cfg.enable_selector);
         assert_eq!(loaded.selector, cfg.selector);
         assert_eq!(loaded.term_exec_args, cfg.term_exec_args);
         assert_eq!(loaded.expand_wildcards, cfg.expand_wildcards);
-
-        // SAFETY: single-threaded test
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
     fn save_preserves_handlers_section() {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test (run with --test-threads=1)
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-
-        // Write a file that already has a [[handlers]] block.
-        let path = dir.path().join("handlr").join("handlr.toml");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = dir.path().join("handlr.toml");
         std::fs::write(
             &path,
             "enable_selector = false\n\n[[handlers]]\nregex = 'https?://'\nhandler = 'firefox.desktop'\n",
         )
         .unwrap();
 
-        let mut cfg = load().unwrap();
+        let mut cfg = load_from(&path).unwrap();
         cfg.enable_selector = true;
-        save(&cfg).unwrap();
+        save_to(&cfg, &path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[handlers]]"), "handlers section must be preserved");
         assert!(text.contains("enable_selector = true"));
-
-        // SAFETY: single-threaded test
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test (run with --test-threads=1)
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let path = dir.path().join("handlr.toml");
         // No file created — load must succeed with defaults.
-        let cfg = load().unwrap();
+        let cfg = load_from(&path).unwrap();
         assert!(!cfg.enable_selector);
-        // SAFETY: single-threaded test
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(cfg.term_exec_args, "-e");
     }
 }
