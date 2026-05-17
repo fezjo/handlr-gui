@@ -1986,6 +1986,7 @@ struct RegexAttempt {
     pattern: String,
     matched: bool,
     invalid: bool,
+    skipped: bool,
 }
 
 enum ResolutionKind {
@@ -2020,30 +2021,46 @@ fn resolve_input(
     let mut regex_attempts = Vec::new();
 
     // 1. Try regex handlers against raw input string.
-    // resolve_exec_name is deferred to after a match to avoid iterating all apps per handler.
+    // We collect ALL attempts (including skipped ones after the first match) for display.
+    let mut winner: Option<(usize, String)> = None; // (handler_idx, winning_pattern)
     for (idx, handler) in config.handlers.iter().enumerate() {
         let exec_short = handler.exec.split_whitespace().next().unwrap_or(&handler.exec).to_string();
         for pattern in &handler.regexes {
+            if winner.is_some() {
+                regex_attempts.push(RegexAttempt {
+                    handler_display: exec_short.clone(),
+                    pattern: pattern.clone(),
+                    matched: false,
+                    invalid: false,
+                    skipped: true,
+                });
+                continue;
+            }
             let compile_result = regex::Regex::new(pattern);
             let invalid = compile_result.is_err();
             let matched = compile_result.map(|re| re.is_match(input)).unwrap_or(false);
+            if matched {
+                winner = Some((idx, pattern.clone()));
+            }
             regex_attempts.push(RegexAttempt {
                 handler_display: exec_short.clone(),
                 pattern: pattern.clone(),
                 matched,
                 invalid,
+                skipped: false,
             });
-            if matched {
-                let display_name = resolve_exec_name(&handler.exec, apps);
-                return Resolution {
-                    kind: ResolutionKind::Regex { handler_idx: idx, pattern: pattern.clone() },
-                    display_name,
-                    icon: resolve_app_icon(&handler.exec, apps),
-                    regex_attempts,
-                    detected_mime: None,
-                };
-            }
         }
+    }
+    if let Some((idx, ref pattern)) = winner {
+        let handler = &config.handlers[idx];
+        let display_name = resolve_exec_name(&handler.exec, apps);
+        return Resolution {
+            kind: ResolutionKind::Regex { handler_idx: idx, pattern: pattern.clone() },
+            display_name,
+            icon: resolve_app_icon(&handler.exec, apps),
+            regex_attempts,
+            detected_mime: None,
+        };
     }
 
     // 2. Determine MIME type.
@@ -2179,7 +2196,8 @@ fn build_resolution_display(
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             row.set_margin_top(2);
 
-            let tick = gtk4::Label::new(Some(if attempt.matched { "✓" } else { "✗" }));
+            let tick_text = if attempt.skipped { "—" } else if attempt.matched { "✓" } else { "✗" };
+            let tick = gtk4::Label::new(Some(tick_text));
             if attempt.matched {
                 tick.add_css_class("success");
             } else {
@@ -2194,27 +2212,30 @@ fn build_resolution_display(
             desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             desc.set_hexpand(true);
             desc.set_xalign(0.0);
-            if !attempt.matched {
-                desc.add_css_class("dim-label");
+            desc.add_css_class("dim-label");
+            if !attempt.matched && !attempt.skipped {
+                // keep normal dim
             }
             row.append(&desc);
 
-            let result_text = if attempt.invalid {
-                "invalid pattern"
-            } else if attempt.matched {
-                "matched"
-            } else {
-                "no match"
-            };
-            let result_label = gtk4::Label::new(Some(result_text));
-            if attempt.matched {
-                result_label.add_css_class("success");
-            } else if attempt.invalid {
-                result_label.add_css_class("error");
-            } else {
-                result_label.add_css_class("dim-label");
+            if !attempt.skipped {
+                let result_text = if attempt.invalid {
+                    "invalid pattern"
+                } else if attempt.matched {
+                    "matched"
+                } else {
+                    "no match"
+                };
+                let result_label = gtk4::Label::new(Some(result_text));
+                if attempt.matched {
+                    result_label.add_css_class("success");
+                } else if attempt.invalid {
+                    result_label.add_css_class("error");
+                } else {
+                    result_label.add_css_class("dim-label");
+                }
+                row.append(&result_label);
             }
-            row.append(&result_label);
 
             chain_box.append(&row);
         }
