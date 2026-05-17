@@ -1985,6 +1985,7 @@ struct RegexAttempt {
     handler_display: String,
     pattern: String,
     matched: bool,
+    invalid: bool,
 }
 
 enum ResolutionKind {
@@ -2019,21 +2020,24 @@ fn resolve_input(
     let mut regex_attempts = Vec::new();
 
     // 1. Try regex handlers against raw input string.
+    // resolve_exec_name is deferred to after a match to avoid iterating all apps per handler.
     for (idx, handler) in config.handlers.iter().enumerate() {
-        let handler_display = resolve_exec_name(&handler.exec, apps);
+        let exec_short = handler.exec.split_whitespace().next().unwrap_or(&handler.exec).to_string();
         for pattern in &handler.regexes {
-            let matched = regex::Regex::new(pattern)
-                .map(|re| re.is_match(input))
-                .unwrap_or(false);
+            let compile_result = regex::Regex::new(pattern);
+            let invalid = compile_result.is_err();
+            let matched = compile_result.map(|re| re.is_match(input)).unwrap_or(false);
             regex_attempts.push(RegexAttempt {
-                handler_display: handler_display.clone(),
+                handler_display: exec_short.clone(),
                 pattern: pattern.clone(),
                 matched,
+                invalid,
             });
             if matched {
+                let display_name = resolve_exec_name(&handler.exec, apps);
                 return Resolution {
                     kind: ResolutionKind::Regex { handler_idx: idx, pattern: pattern.clone() },
-                    display_name: handler_display,
+                    display_name,
                     icon: resolve_app_icon(&handler.exec, apps),
                     regex_attempts,
                     detected_mime: None,
@@ -2155,12 +2159,18 @@ fn build_resolution_display(
 
     results_box.append(&card);
 
-    // Resolution chain (only if there were regex attempts).
-    if !resolution.regex_attempts.is_empty() {
+    // Resolution chain — always shown so users can diagnose empty/missing handler configs.
+    {
         let chain_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         chain_box.set_margin_top(8);
 
-        let chain_header = gtk4::Label::new(Some("Resolution chain"));
+        let n = resolution.regex_attempts.len();
+        let header_text = if n == 0 {
+            "Resolution chain (no regex handlers configured)".to_string()
+        } else {
+            format!("Resolution chain ({} regex pattern{} checked)", n, if n == 1 { "" } else { "s" })
+        };
+        let chain_header = gtk4::Label::new(Some(&header_text));
         chain_header.add_css_class("heading");
         chain_header.set_halign(gtk4::Align::Start);
         chain_box.append(&chain_header);
@@ -2189,9 +2199,18 @@ fn build_resolution_display(
             }
             row.append(&desc);
 
-            let result_label = gtk4::Label::new(Some(if attempt.matched { "matched" } else { "no match" }));
+            let result_text = if attempt.invalid {
+                "invalid pattern"
+            } else if attempt.matched {
+                "matched"
+            } else {
+                "no match"
+            };
+            let result_label = gtk4::Label::new(Some(result_text));
             if attempt.matched {
                 result_label.add_css_class("success");
+            } else if attempt.invalid {
+                result_label.add_css_class("error");
             } else {
                 result_label.add_css_class("dim-label");
             }
@@ -2244,7 +2263,7 @@ pub(crate) fn build_tester_tab(
     entry.set_hexpand(true);
     inner.append(&entry);
 
-    // Drag-and-drop: accept files dropped onto the entry.
+    // Drag-and-drop: accept files dropped anywhere on the tab.
     let drop_target = gtk4::DropTarget::builder()
         .actions(gdk::DragAction::COPY)
         .build();
@@ -2265,7 +2284,7 @@ pub(crate) fn build_tester_tab(
             false
         });
     }
-    entry.add_controller(drop_target);
+    outer.add_controller(drop_target);
 
     // Results area.
     let results_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
