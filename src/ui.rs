@@ -213,11 +213,8 @@ pub(crate) fn build_window(
     // Wrap inner stack in a named page of main_tabs.
     main_tabs.add_titled(&stack, Some("defaults"), "Defaults");
 
-    let regex_stub = gtk4::Label::new(Some("Coming soon"));
-    regex_stub.add_css_class("dim-label");
-    regex_stub.set_halign(gtk4::Align::Center);
-    regex_stub.set_valign(gtk4::Align::Center);
-    main_tabs.add_titled(&regex_stub, Some("regex-handlers"), "Regex Handlers");
+    let regex_tab = build_regex_handlers_tab(config.clone(), state.clone());
+    main_tabs.add_titled(&regex_tab, Some("regex-handlers"), "Regex Handlers");
 
     vbox.append(&main_tabs);
 
@@ -1412,4 +1409,445 @@ fn entry_row(title: &str, subtitle: &str, entry: &gtk4::Entry) -> gtk4::ListBoxR
     row.set_activatable(false);
     row.set_child(Some(&row_box));
     row
+}
+
+// --- Regex Handlers tab ---------------------------------------------------------------
+
+pub(crate) fn build_regex_handlers_tab(
+    config: Rc<RefCell<crate::config::Config>>,
+    state: Rc<RefCell<AppState>>,
+) -> gtk4::Widget {
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    // Toolbar row.
+    let toolbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    toolbar.set_margin_top(6);
+    toolbar.set_margin_bottom(6);
+    toolbar.set_margin_start(10);
+    toolbar.set_margin_end(10);
+
+    let add_btn = gtk4::Button::with_label("Add handler");
+    add_btn.set_halign(gtk4::Align::End);
+    add_btn.set_hexpand(true);
+    toolbar.append(&add_btn);
+    outer.append(&toolbar);
+
+    let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    outer.append(&sep);
+
+    // Scrolled card list.
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+
+    let cards_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    cards_box.set_margin_top(8);
+    cards_box.set_margin_bottom(8);
+    cards_box.set_margin_start(10);
+    cards_box.set_margin_end(10);
+    scrolled.set_child(Some(&cards_box));
+    outer.append(&scrolled);
+
+    // Collect apps from AppState.
+    let apps: Vec<handlr::App> = state
+        .borrow()
+        .state()
+        .system_apps
+        .iter()
+        .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+        .collect();
+
+    rebuild_handler_cards(&cards_box, &config, &apps);
+
+    // Add handler button: append a new empty card.
+    {
+        let cards_box = cards_box.clone();
+        let config = config.clone();
+        let apps = apps.clone();
+        add_btn.connect_clicked(move |_| {
+            let card = build_handler_card(None, config.clone(), cards_box.clone(), apps.clone());
+            cards_box.append(&card);
+        });
+    }
+
+    outer.upcast()
+}
+
+fn rebuild_handler_cards(
+    cards_box: &gtk4::Box,
+    config: &Rc<RefCell<crate::config::Config>>,
+    apps: &[handlr::App],
+) {
+    while let Some(child) = cards_box.first_child() {
+        cards_box.remove(&child);
+    }
+    let n = config.borrow().handlers.len();
+    for idx in 0..n {
+        let card = build_handler_card(
+            Some(idx),
+            config.clone(),
+            cards_box.clone(),
+            apps.to_vec(),
+        );
+        cards_box.append(&card);
+    }
+}
+
+fn build_handler_card(
+    idx: Option<usize>,
+    config: Rc<RefCell<crate::config::Config>>,
+    cards_box: gtk4::Box,
+    apps: Vec<handlr::App>,
+) -> gtk4::Box {
+    let is_new = idx.is_none();
+    let handler = idx
+        .and_then(|i| config.borrow().handlers.get(i).cloned())
+        .unwrap_or_default();
+
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    card.add_css_class("card");
+
+    // ── Header row ────────────────────────────────────────────────────────────
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    header.set_margin_top(6);
+    header.set_margin_bottom(6);
+    header.set_margin_start(8);
+    header.set_margin_end(8);
+
+    let toggle_btn = gtk4::ToggleButton::new();
+    toggle_btn.set_icon_name(if is_new { "pan-down-symbolic" } else { "pan-end-symbolic" });
+    toggle_btn.add_css_class("flat");
+    toggle_btn.set_active(is_new);
+
+    let summary_label = gtk4::Label::new(None);
+    summary_label.set_hexpand(true);
+    summary_label.set_xalign(0.0);
+    summary_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    if is_new {
+        summary_label.set_text("New handler");
+        summary_label.add_css_class("dim-label");
+    } else {
+        let exec_short = handler.exec.split_whitespace().next().unwrap_or("(no command)");
+        let count = handler.regexes.len();
+        summary_label.set_text(&format!(
+            "{} — {} regex{}",
+            exec_short,
+            count,
+            if count == 1 { "" } else { "es" }
+        ));
+    }
+
+    header.append(&toggle_btn);
+    header.append(&summary_label);
+
+    // ▲/▼ reorder buttons (existing handlers only).
+    if let Some(i) = idx {
+        let n = config.borrow().handlers.len();
+
+        let up_btn = gtk4::Button::from_icon_name("go-up-symbolic");
+        up_btn.add_css_class("flat");
+        up_btn.set_tooltip_text(Some("Move up"));
+        up_btn.set_sensitive(i > 0);
+
+        let down_btn = gtk4::Button::from_icon_name("go-down-symbolic");
+        down_btn.add_css_class("flat");
+        down_btn.set_tooltip_text(Some("Move down"));
+        down_btn.set_sensitive(i + 1 < n);
+
+        {
+            let config = config.clone();
+            let cards_box = cards_box.clone();
+            let apps = apps.clone();
+            up_btn.connect_clicked(move |_| {
+                {
+                    let mut cfg = config.borrow_mut();
+                    cfg.handlers.swap(i, i - 1);
+                }
+                let _ = crate::config::save(&config.borrow());
+                rebuild_handler_cards(&cards_box, &config, &apps);
+            });
+        }
+        {
+            let config = config.clone();
+            let cards_box = cards_box.clone();
+            let apps = apps.clone();
+            down_btn.connect_clicked(move |_| {
+                {
+                    let mut cfg = config.borrow_mut();
+                    cfg.handlers.swap(i, i + 1);
+                }
+                let _ = crate::config::save(&config.borrow());
+                rebuild_handler_cards(&cards_box, &config, &apps);
+            });
+        }
+
+        header.append(&up_btn);
+        header.append(&down_btn);
+    }
+
+    card.append(&header);
+
+    let hsep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    card.append(&hsep);
+
+    // ── Expandable body ───────────────────────────────────────────────────────
+    let revealer = gtk4::Revealer::new();
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    revealer.set_reveal_child(is_new);
+    card.append(&revealer);
+
+    {
+        let revealer = revealer.clone();
+        toggle_btn.connect_toggled(move |btn| {
+            revealer.set_reveal_child(btn.is_active());
+            btn.set_icon_name(if btn.is_active() {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            });
+        });
+    }
+
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    body.set_margin_top(8);
+    body.set_margin_bottom(8);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    revealer.set_child(Some(&body));
+
+    // Regexes section.
+    let regexes_label = gtk4::Label::new(Some("Regexes"));
+    regexes_label.set_halign(gtk4::Align::Start);
+    regexes_label.add_css_class("heading");
+    body.append(&regexes_label);
+
+    let regex_box = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
+    body.append(&regex_box);
+
+    for regex_str in &handler.regexes {
+        append_regex_row(&regex_box, regex_str);
+    }
+
+    let add_regex_btn = gtk4::Button::with_label("＋ Add regex");
+    add_regex_btn.add_css_class("flat");
+    add_regex_btn.set_halign(gtk4::Align::Start);
+    {
+        let regex_box = regex_box.clone();
+        add_regex_btn.connect_clicked(move |_| {
+            append_regex_row(&regex_box, "");
+        });
+    }
+    body.append(&add_regex_btn);
+
+    // Command section.
+    let cmd_label = gtk4::Label::new(Some("Command"));
+    cmd_label.set_halign(gtk4::Align::Start);
+    cmd_label.add_css_class("heading");
+    body.append(&cmd_label);
+
+    let cmd_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let exec_entry = gtk4::Entry::new();
+    exec_entry.set_text(&handler.exec);
+    exec_entry.set_hexpand(true);
+    exec_entry.set_placeholder_text(Some("e.g. mpv %f"));
+    cmd_row.append(&exec_entry);
+
+    let browse_btn = gtk4::Button::with_label("Browse apps…");
+    {
+        let exec_entry = exec_entry.clone();
+        let apps = apps.clone();
+        browse_btn.connect_clicked(move |btn| {
+            show_app_picker(btn.upcast_ref::<gtk4::Widget>(), &apps, {
+                let exec_entry = exec_entry.clone();
+                move |desktop| {
+                    let cmd = gio::DesktopAppInfo::new(&desktop)
+                        .and_then(|info| info.commandline())
+                        .map(|path| {
+                            let s = path.to_string_lossy();
+                            let mut parts = s.splitn(2, ' ');
+                            let exe_path = parts.next().unwrap_or("");
+                            let args = parts.next().unwrap_or("");
+                            let basename = std::path::Path::new(exe_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| exe_path.to_string());
+                            if args.is_empty() {
+                                basename
+                            } else {
+                                format!("{} {}", basename, args)
+                            }
+                        })
+                        .unwrap_or_else(|| desktop.clone());
+                    exec_entry.set_text(&cmd);
+                }
+            });
+        });
+    }
+    cmd_row.append(&browse_btn);
+    body.append(&cmd_row);
+
+    // Terminal checkbox.
+    let terminal_check = gtk4::CheckButton::with_label("Open in terminal");
+    terminal_check.set_active(handler.terminal);
+    body.append(&terminal_check);
+
+    // Error label (hidden until needed).
+    let err_label = gtk4::Label::new(None);
+    err_label.add_css_class("error");
+    err_label.set_halign(gtk4::Align::Start);
+    err_label.set_wrap(true);
+    err_label.set_visible(false);
+    body.append(&err_label);
+
+    // Action buttons.
+    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+    let left_btn = if is_new {
+        let b = gtk4::Button::with_label("Discard");
+        {
+            let card = card.clone();
+            let cards_box = cards_box.clone();
+            b.connect_clicked(move |_| {
+                cards_box.remove(&card);
+            });
+        }
+        b
+    } else {
+        let b = gtk4::Button::with_label("Delete");
+        b.add_css_class("destructive-action");
+        {
+            let config = config.clone();
+            let cards_box = cards_box.clone();
+            let apps = apps.clone();
+            let i = idx.unwrap();
+            b.connect_clicked(move |_| {
+                config.borrow_mut().handlers.remove(i);
+                let _ = crate::config::save(&config.borrow());
+                rebuild_handler_cards(&cards_box, &config, &apps);
+            });
+        }
+        b
+    };
+    actions.append(&left_btn);
+
+    let spacer = gtk4::Label::new(None);
+    spacer.set_hexpand(true);
+    actions.append(&spacer);
+
+    let apply_btn = gtk4::Button::with_label("Apply");
+    apply_btn.add_css_class("suggested-action");
+    {
+        let config = config.clone();
+        let cards_box = cards_box.clone();
+        let apps = apps.clone();
+        let regex_box = regex_box.clone();
+        let exec_entry = exec_entry.clone();
+        let terminal_check = terminal_check.clone();
+        let err_label = err_label.clone();
+        let summary_label = summary_label.clone();
+        let toggle_btn = toggle_btn.clone();
+
+        apply_btn.connect_clicked(move |_| {
+            let regexes = collect_regexes(&regex_box);
+            let exec = exec_entry.text().trim().to_string();
+
+            let mut errors: Vec<&str> = Vec::new();
+            if regexes.is_empty() {
+                errors.push("At least one regex is required.");
+            }
+            if exec.is_empty() {
+                errors.push("Command must not be empty.");
+            }
+            if !errors.is_empty() {
+                err_label.set_text(&errors.join(" "));
+                err_label.set_visible(true);
+                return;
+            }
+
+            let new_handler = crate::config::RegexHandler {
+                regexes,
+                exec: exec.clone(),
+                terminal: terminal_check.is_active(),
+            };
+
+            if let Some(i) = idx {
+                config.borrow_mut().handlers[i] = new_handler;
+                let _ = crate::config::save(&config.borrow());
+                let cfg = config.borrow();
+                let h = &cfg.handlers[i];
+                let exec_short = h.exec.split_whitespace().next().unwrap_or("(no command)");
+                let count = h.regexes.len();
+                summary_label.set_text(&format!(
+                    "{} — {} regex{}",
+                    exec_short,
+                    count,
+                    if count == 1 { "" } else { "es" }
+                ));
+                toggle_btn.set_active(false);
+            } else {
+                config.borrow_mut().handlers.push(new_handler);
+                let _ = crate::config::save(&config.borrow());
+                rebuild_handler_cards(&cards_box, &config, &apps);
+            }
+
+            err_label.set_visible(false);
+        });
+    }
+    actions.append(&apply_btn);
+    body.append(&actions);
+
+    card
+}
+
+fn append_regex_row(regex_box: &gtk4::Box, initial: &str) {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+
+    let entry = gtk4::Entry::new();
+    entry.set_text(initial);
+    entry.set_hexpand(true);
+    entry.set_placeholder_text(Some("regex pattern"));
+
+    entry.connect_changed(|e| {
+        let text = e.text();
+        if text.is_empty() || regex::Regex::new(text.as_str()).is_ok() {
+            e.remove_css_class("error");
+        } else {
+            e.add_css_class("error");
+        }
+    });
+
+    let rm_btn = gtk4::Button::from_icon_name("edit-delete-symbolic");
+    rm_btn.add_css_class("flat");
+    rm_btn.set_tooltip_text(Some("Remove regex"));
+    {
+        let row = row.clone();
+        let regex_box = regex_box.clone();
+        rm_btn.connect_clicked(move |_| {
+            regex_box.remove(&row);
+        });
+    }
+
+    row.append(&entry);
+    row.append(&rm_btn);
+    regex_box.append(&row);
+}
+
+fn collect_regexes(regex_box: &gtk4::Box) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut child = regex_box.first_child();
+    while let Some(w) = child {
+        if let Some(row) = w.downcast_ref::<gtk4::Box>() {
+            if let Some(entry) = row
+                .first_child()
+                .and_then(|c| c.downcast::<gtk4::Entry>().ok())
+            {
+                let t = entry.text().trim().to_string();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+        child = w.next_sibling();
+    }
+    out
 }

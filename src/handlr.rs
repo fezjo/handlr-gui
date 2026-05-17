@@ -12,7 +12,7 @@ pub(crate) struct State {
     pub(crate) system_apps: Vec<App>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct App {
     pub(crate) desktop: String,
     pub(crate) name: String,
