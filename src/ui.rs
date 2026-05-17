@@ -1562,6 +1562,10 @@ fn build_handler_card(
     summary_label.set_hexpand(true);
     summary_label.set_xalign(0.0);
     summary_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    // App icon (existing handlers only).
+    let icon_image = gtk4::Image::new();
+    icon_image.set_pixel_size(16);
+
     if is_new {
         summary_label.set_text("New handler");
         summary_label.add_css_class("dim-label");
@@ -1578,9 +1582,17 @@ fn build_handler_card(
             count,
             if count == 1 { "" } else { "es" }
         ));
+
+        // Look up icon from the matching DesktopAppInfo.
+        if let Some(icon) = resolve_app_icon(&handler.exec, &apps) {
+            icon_image.set_from_gicon(&icon);
+        }
     }
 
     header.append(&toggle_btn);
+    if !is_new {
+        header.append(&icon_image);
+    }
     header.append(&summary_label);
 
     // ▲/▼ reorder buttons (existing handlers only).
@@ -1936,6 +1948,32 @@ fn resolve_exec_name(exec: &str, apps: &[handlr::App]) -> String {
     }
 
     exec_basename
+}
+
+fn resolve_app_icon(exec: &str, apps: &[handlr::App]) -> Option<gio::Icon> {
+    let exec_basename = exec
+        .split_whitespace()
+        .next()
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .map(|n| n.to_string_lossy().into_owned())?;
+
+    for app in apps {
+        if let Some(info) = gio::DesktopAppInfo::new(&app.desktop)
+            && let Some(cmdline) = info.commandline()
+        {
+            let basename = cmdline
+                .to_string_lossy()
+                .split_whitespace()
+                .next()
+                .and_then(|s| std::path::Path::new(s).file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if basename == exec_basename {
+                return info.icon();
+            }
+        }
+    }
+    None
 }
 
 fn collect_regexes(regex_box: &gtk4::Box) -> Vec<String> {
