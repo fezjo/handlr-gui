@@ -293,8 +293,7 @@ pub(crate) fn build_window(
         let config = config.clone();
         let settings_win = settings_win.clone();
         gear_btn.connect_clicked(move |_| {
-            let mut opt = settings_win.borrow_mut();
-            if let Some(existing) = opt.as_ref() {
+            if let Some(existing) = settings_win.borrow().as_ref() {
                 existing.present();
                 return;
             }
@@ -307,7 +306,7 @@ pub(crate) fn build_window(
                 }
             });
             dlg.present();
-            *opt = Some(dlg);
+            *settings_win.borrow_mut() = Some(dlg);
         });
     }
 
@@ -1204,6 +1203,12 @@ fn build_settings_dialog(
         .default_width(420)
         .build();
 
+    let dlg_header = gtk4::HeaderBar::new();
+    let close_btn = gtk4::Button::with_label("Close");
+    close_btn.add_css_class("suggested-action");
+    dlg_header.pack_end(&close_btn);
+    dlg.set_titlebar(Some(&dlg_header));
+
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     outer.set_margin_top(16);
     outer.set_margin_bottom(16);
@@ -1326,6 +1331,24 @@ fn build_settings_dialog(
         });
     }
 
+    {
+        let dlg = dlg.clone();
+        close_btn.connect_clicked(move |_| dlg.close());
+    }
+
+    let key_ctrl = gtk4::EventControllerKey::new();
+    {
+        let dlg = dlg.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                dlg.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    dlg.add_controller(key_ctrl);
+
     dlg
 }
 
@@ -1391,6 +1414,7 @@ fn entry_row(title: &str, subtitle: &str, entry: &gtk4::Entry) -> gtk4::ListBoxR
     sub_label.set_wrap(true);
     row_box.append(&title_label);
     row_box.append(&sub_label);
+    entry.set_hexpand(true);
     row_box.append(entry);
 
     let row = gtk4::ListBoxRow::new();

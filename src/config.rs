@@ -25,10 +25,10 @@ impl Default for Config {
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
     }
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
