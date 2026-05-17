@@ -1,0 +1,1105 @@
+//! Window shell + interactive wiring. Header bar, info bar, list view + tree model +
+//! factory, app-picker popover, add-exception dialog, global keyboard shortcuts.
+
+use crate::handlr;
+use crate::model::{self, AppState, Row};
+use crate::undo::{self, UndoEntry};
+use gtk4::gdk;
+use gtk4::gio;
+use gtk4::glib;
+use gtk4::prelude::*;
+use gtk4::subclass::prelude::ObjectSubclassIsExt;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+mod imp {
+    use super::*;
+    use glib::subclass::prelude::*;
+
+    #[derive(Default)]
+    pub(crate) struct RowObject {
+        pub(super) row: RefCell<Option<Row>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for RowObject {
+        const NAME: &'static str = "HandlrGuiRowObject";
+        type Type = super::RowObject;
+    }
+
+    impl ObjectImpl for RowObject {}
+
+    #[derive(Default)]
+    pub(crate) struct AppObject {
+        pub(super) app: RefCell<Option<handlr::App>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for AppObject {
+        const NAME: &'static str = "HandlrGuiAppObject";
+        type Type = super::AppObject;
+    }
+
+    impl ObjectImpl for AppObject {}
+}
+
+glib::wrapper! {
+    pub(crate) struct RowObject(ObjectSubclass<imp::RowObject>);
+}
+
+impl RowObject {
+    fn new(row: Row) -> Self {
+        let obj: Self = glib::Object::new();
+        obj.imp().row.replace(Some(row));
+        obj
+    }
+
+    fn row(&self) -> Row {
+        self.imp().row.borrow().clone().expect("RowObject row not set")
+    }
+}
+
+glib::wrapper! {
+    pub(crate) struct AppObject(ObjectSubclass<imp::AppObject>);
+}
+
+impl AppObject {
+    fn new(app: handlr::App) -> Self {
+        let obj: Self = glib::Object::new();
+        obj.imp().app.replace(Some(app));
+        obj
+    }
+
+    fn desktop(&self) -> String {
+        self.imp().app.borrow().as_ref().expect("app not set").desktop.clone()
+    }
+
+    fn name(&self) -> String {
+        self.imp().app.borrow().as_ref().expect("app not set").name.clone()
+    }
+}
+
+// Bundle of Rc-clonable references threaded into every action closure. Lets us hand
+// one struct to bind_row instead of juggling N captured clones per closure.
+#[derive(Clone)]
+struct Wiring {
+    state: Rc<RefCell<AppState>>,
+    root_store: gio::ListStore,
+    stack: gtk4::Stack,
+    undo_btn: gtk4::Button,
+    redo_btn: gtk4::Button,
+    revealer: gtk4::Revealer,
+    info_label: gtk4::Label,
+    window: gtk4::ApplicationWindow,
+}
+
+// Handle to the parts of the window that out-of-module callers (dnd, future features) need
+// to reach into. Kept small: just enough to find a row, scroll to it, and surface errors.
+#[derive(Clone)]
+pub(crate) struct TreeHandle {
+    pub(crate) list_view: gtk4::ListView,
+    pub(crate) root_store: gio::ListStore,
+    pub(crate) revealer: gtk4::Revealer,
+    pub(crate) info_label: gtk4::Label,
+}
+
+pub(crate) fn build_window(
+    app: &gtk4::Application,
+    state: Rc<RefCell<AppState>>,
+) -> (gtk4::ApplicationWindow, TreeHandle) {
+    let window = gtk4::ApplicationWindow::builder()
+        .application(app)
+        .title("handlr-gui")
+        .default_width(720)
+        .default_height(600)
+        .build();
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    window.set_child(Some(&vbox));
+
+    // Header bar with action buttons.
+    let header = gtk4::HeaderBar::new();
+
+    let undo_btn = gtk4::Button::from_icon_name("edit-undo-symbolic");
+    undo_btn.set_tooltip_text(Some("Undo"));
+    undo_btn.set_sensitive(false);
+    header.pack_start(&undo_btn);
+
+    let redo_btn = gtk4::Button::from_icon_name("edit-redo-symbolic");
+    redo_btn.set_tooltip_text(Some("Redo"));
+    redo_btn.set_sensitive(false);
+    header.pack_start(&redo_btn);
+
+    let menu = gio::Menu::new();
+    menu.append(Some("About"), Some("win.about"));
+    menu.append(Some("Quit"), Some("win.quit"));
+    let menu_btn = gtk4::MenuButton::new();
+    menu_btn.set_icon_name("open-menu-symbolic");
+    menu_btn.set_menu_model(Some(&menu));
+    header.pack_end(&menu_btn);
+
+    let reload_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
+    reload_btn.set_tooltip_text(Some("Reload"));
+    header.pack_end(&reload_btn);
+
+    window.set_titlebar(Some(&header));
+
+    // Error info bar wrapped in a revealer. InfoBar is deprecated since GTK 4.10
+    // but it's the spec'd widget and there's no drop-in replacement in v1.
+    #[allow(deprecated)]
+    let (revealer, info_label) = build_info_bar(&vbox);
+
+    // Stack to flip between populated tree and the empty placeholder.
+    let stack = gtk4::Stack::new();
+    stack.set_vexpand(true);
+
+    // Build the list view shell first (model + factory setup, no bind callback yet)
+    // so we can put it in TreeHandle and attach bind_row after Wiring is constructed.
+    let root_store = gio::ListStore::new::<RowObject>();
+    let (list_view, factory) = build_list_view(root_store.clone(), state.clone());
+
+    let wiring = Wiring {
+        state: state.clone(),
+        root_store: root_store.clone(),
+        stack: stack.clone(),
+        undo_btn: undo_btn.clone(),
+        redo_btn: redo_btn.clone(),
+        revealer: revealer.clone(),
+        info_label: info_label.clone(),
+        window: window.clone(),
+    };
+
+    // Attach the bind callback now that Wiring is fully constructed.
+    {
+        let wiring = wiring.clone();
+        factory.connect_bind(move |_factory, item| bind_row(item, &wiring));
+    }
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_view));
+    stack.add_named(&scrolled, Some("tree"));
+
+    let empty_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    empty_box.set_halign(gtk4::Align::Center);
+    empty_box.set_valign(gtk4::Align::Center);
+    let empty_label = gtk4::Label::new(Some(
+        "No defaults configured. Drop a file here or use the CLI to add one.",
+    ));
+    empty_box.append(&empty_label);
+    stack.add_named(&empty_box, Some("empty"));
+
+    vbox.append(&stack);
+
+    // Initial population + header sensitivity.
+    refresh_view(&wiring);
+
+    // Reload.
+    {
+        let wiring = wiring.clone();
+        reload_btn.connect_clicked(move |_| match handlr::list_all() {
+            Ok(s) => {
+                wiring.state.borrow_mut().set_state(s);
+                refresh_view(&wiring);
+                hide_banner(&wiring.revealer);
+            }
+            Err(e) => show_error(&wiring.revealer, &wiring.info_label, &format!("Reload failed: {}", e)),
+        });
+    }
+
+    // Undo / Redo.
+    {
+        let wiring = wiring.clone();
+        undo_btn.connect_clicked(move |_| {
+            let result = wiring.state.borrow_mut().undo();
+            handle_action_result(&wiring, result.map(|_| ()));
+        });
+    }
+    {
+        let wiring = wiring.clone();
+        redo_btn.connect_clicked(move |_| {
+            let result = wiring.state.borrow_mut().redo();
+            handle_action_result(&wiring, result.map(|_| ()));
+        });
+    }
+
+    // Win actions: about, quit, and click-forwarders so Ctrl+R/Z/Y/Shift+Z can fire
+    // the header buttons through NamedAction triggers.
+    add_action(&window, "about", {
+        let window = window.clone();
+        move || {
+            gtk4::AboutDialog::builder()
+                .program_name("handlr-gui")
+                .comments("GTK4 frontend for the handlr CLI: manage default MIME associations.")
+                .transient_for(&window)
+                .modal(true)
+                .build()
+                .present();
+        }
+    });
+    add_action(&window, "quit", {
+        let app = app.clone();
+        move || app.quit()
+    });
+    add_action(&window, "reload", {
+        let b = reload_btn.clone();
+        move || b.emit_clicked()
+    });
+    add_action(&window, "undo", {
+        let b = undo_btn.clone();
+        move || if b.is_sensitive() { b.emit_clicked() }
+    });
+    add_action(&window, "redo", {
+        let b = redo_btn.clone();
+        move || if b.is_sensitive() { b.emit_clicked() }
+    });
+
+    install_shortcuts(&window);
+
+    // Delete on the focused tree row: clear/remove per §6.
+    {
+        let wiring = wiring.clone();
+        let list_view_for_key = list_view.clone();
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Delete {
+                return glib::Propagation::Proceed;
+            }
+            let Some(entry) = delete_target(&list_view_for_key) else {
+                return glib::Propagation::Proceed;
+            };
+            apply_entry(&wiring, entry);
+            glib::Propagation::Stop
+        });
+        list_view.add_controller(key_ctrl);
+    }
+
+    let tree = TreeHandle {
+        list_view: list_view.clone(),
+        root_store: root_store.clone(),
+        revealer: revealer.clone(),
+        info_label: info_label.clone(),
+    };
+    (window, tree)
+}
+
+// Find the row whose mime matches `mime`, scroll the list view to it, and return true.
+// Returns false when no row matches — caller decides how to surface that (e.g. banner).
+// v1 limitation: for exception mimes (e.g. "video/mp4"), we scroll to the parent
+// Category ("video/*") rather than expanding it and scrolling to the exception row.
+// Expanding requires walking the TreeListModel post-render, which is non-trivial.
+pub(crate) fn scroll_to_mime(handle: &TreeHandle, mime: &str) -> bool {
+    let Some(idx) = locate_mime(handle, mime) else {
+        return false;
+    };
+    handle
+        .list_view
+        .scroll_to(idx, gtk4::ListScrollFlags::FOCUS, None);
+    true
+}
+
+// Walks the root store and returns the index of the best matching Category row, or None.
+// Prefers an exact Category mime match; falls back to the longest wildcard-prefix match.
+fn locate_mime(handle: &TreeHandle, mime: &str) -> Option<u32> {
+    let store = &handle.root_store;
+    let n = store.n_items();
+
+    // Pass 1: exact match against any Category mime.
+    for i in 0..n {
+        let Some(obj) = store.item(i) else { continue };
+        let Some(row_obj) = obj.downcast_ref::<RowObject>() else {
+            continue;
+        };
+        if let Row::Category { mime: m, .. } = row_obj.row()
+            && m == mime
+        {
+            return Some(i);
+        }
+    }
+
+    // Pass 2: longest wildcard prefix match — scroll to parent category.
+    let mut best: Option<(usize, u32)> = None; // (prefix_len, index)
+    for i in 0..n {
+        let Some(obj) = store.item(i) else { continue };
+        let Some(row_obj) = obj.downcast_ref::<RowObject>() else {
+            continue;
+        };
+        if let Row::Category { mime: cat, .. } = row_obj.row()
+            && let Some(prefix) = cat.strip_suffix('*')
+            && mime.starts_with(prefix)
+            && prefix.len() > best.map(|b| b.0).unwrap_or(0)
+        {
+            best = Some((prefix.len(), i));
+        }
+    }
+    best.map(|(_, idx)| idx)
+}
+
+// Surface a message in the window's info bar. Used by out-of-module callers (dnd) that
+// don't have access to the private Wiring struct.
+pub(crate) fn show_banner(handle: &TreeHandle, msg: &str) {
+    handle.info_label.set_text(msg);
+    handle.revealer.set_reveal_child(true);
+}
+
+fn add_action(window: &gtk4::ApplicationWindow, name: &str, callback: impl Fn() + 'static) {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| callback());
+    window.add_action(&action);
+}
+
+// Global keyboard shortcuts (§6). Row-level keys (Enter/Delete/Insert) are deferred —
+// the button affordances cover the operations in v1.
+fn install_shortcuts(window: &gtk4::ApplicationWindow) {
+    let controller = gtk4::ShortcutController::new();
+    controller.set_scope(gtk4::ShortcutScope::Global);
+
+    let bindings = [
+        ("<Control>z", "win.undo"),
+        ("<Control><Shift>z", "win.redo"),
+        ("<Control>y", "win.redo"),
+        ("<Control>r", "win.reload"),
+        ("<Control>q", "win.quit"),
+    ];
+    for (trigger, action) in bindings {
+        let Some(t) = gtk4::ShortcutTrigger::parse_string(trigger) else {
+            continue;
+        };
+        let a = gtk4::NamedAction::new(action);
+        controller.add_shortcut(gtk4::Shortcut::new(Some(t), Some(a)));
+    }
+    window.add_controller(controller);
+}
+
+#[allow(deprecated)]
+fn build_info_bar(vbox: &gtk4::Box) -> (gtk4::Revealer, gtk4::Label) {
+    let revealer = gtk4::Revealer::new();
+    revealer.set_reveal_child(false);
+    let info_bar = gtk4::InfoBar::new();
+    info_bar.set_message_type(gtk4::MessageType::Error);
+    info_bar.set_show_close_button(true);
+    let info_label = gtk4::Label::new(None);
+    info_label.set_xalign(0.0);
+    info_label.set_wrap(true);
+    info_bar.add_child(&info_label);
+    revealer.set_child(Some(&info_bar));
+    vbox.append(&revealer);
+
+    let revealer_clone = revealer.clone();
+    info_bar.connect_response(move |_, _| revealer_clone.set_reveal_child(false));
+
+    (revealer, info_label)
+}
+
+fn show_error(revealer: &gtk4::Revealer, label: &gtk4::Label, msg: &str) {
+    label.set_text(msg);
+    revealer.set_reveal_child(true);
+}
+
+fn hide_banner(revealer: &gtk4::Revealer) {
+    revealer.set_reveal_child(false);
+}
+
+// Common tail for apply/undo/redo: refresh tree + header, surface errors.
+fn handle_action_result(wiring: &Wiring, result: anyhow::Result<()>) {
+    refresh_view(wiring);
+    match result {
+        Ok(()) => hide_banner(&wiring.revealer),
+        Err(e) => show_error(&wiring.revealer, &wiring.info_label, &format!("{}", e)),
+    }
+}
+
+fn apply_entry(wiring: &Wiring, entry: UndoEntry) {
+    // On Err: AppState may have already applied the cmd to disk but failed to resync.
+    // The tree shows pre-action state until Reload. show_error surfaces this to the user.
+    let result = wiring.state.borrow_mut().apply(entry);
+    handle_action_result(wiring, result);
+}
+
+fn refresh_view(wiring: &Wiring) {
+    populate_root(&wiring.root_store, &wiring.state);
+    update_stack(&wiring.stack, &wiring.state);
+    refresh_header(&wiring.state, &wiring.undo_btn, &wiring.redo_btn);
+}
+
+fn refresh_header(
+    state: &Rc<RefCell<AppState>>,
+    undo_btn: &gtk4::Button,
+    redo_btn: &gtk4::Button,
+) {
+    let s = state.borrow();
+    undo_btn.set_sensitive(s.can_undo());
+    undo_btn.set_tooltip_text(Some(
+        &s.undo_label()
+            .map(|l| format!("Undo: {}", l))
+            .unwrap_or_else(|| "Undo".to_string()),
+    ));
+    redo_btn.set_sensitive(s.can_redo());
+    redo_btn.set_tooltip_text(Some(
+        &s.redo_label()
+            .map(|l| format!("Redo: {}", l))
+            .unwrap_or_else(|| "Redo".to_string()),
+    ));
+}
+
+fn update_stack(stack: &gtk4::Stack, state: &Rc<RefCell<AppState>>) {
+    let s = state.borrow();
+    let any_handlers = s.state().defaults.iter().any(|(_, h)| !h.is_empty());
+    let stack_name = if any_handlers { "tree" } else { "empty" };
+    stack.set_visible_child_name(stack_name);
+}
+
+fn populate_root(root_store: &gio::ListStore, state: &Rc<RefCell<AppState>>) {
+    root_store.remove_all();
+    for row in model::build_categories(state.borrow().state()) {
+        root_store.append(&RowObject::new(row));
+    }
+}
+
+// Derive the UndoEntry for "delete the focused row". None when there's nothing to
+// delete (e.g. empty Category, or the default Handler row whose removal must go through
+// "change default" instead).
+fn delete_target(list_view: &gtk4::ListView) -> Option<UndoEntry> {
+    let selection = list_view
+        .model()
+        .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())?;
+    let pos = selection.selected();
+    let tree_row = selection.item(pos)?.downcast::<gtk4::TreeListRow>().ok()?;
+    let row_obj = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok())?;
+    match row_obj.row() {
+        Row::Category { mime, handlers } if !handlers.is_empty() => {
+            Some(undo::clear_category_default(&mime, &handlers))
+        }
+        Row::Exception { mime, handlers } => Some(undo::remove_exception(&mime, &handlers)),
+        Row::Handler { mime, desktop, index, .. } if index > 0 => {
+            Some(undo::remove_handler(&mime, &desktop))
+        }
+        _ => None,
+    }
+}
+
+// Returns (list_view, factory) so the caller can attach connect_bind after Wiring
+// is constructed — bind_row needs Wiring, and Wiring carries the list_view.
+fn build_list_view(
+    root_store: gio::ListStore,
+    state: Rc<RefCell<AppState>>,
+) -> (gtk4::ListView, gtk4::SignalListItemFactory) {
+    // passthrough=false, autoexpand=true: model items are RowObject directly, and categories auto-expand on first show.
+    let tree_model = gtk4::TreeListModel::new(
+        root_store,
+        false,
+        true,
+        move |parent_obj: &glib::Object| create_children(parent_obj, &state),
+    );
+
+    let selection = gtk4::SingleSelection::new(Some(tree_model));
+
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(setup_row);
+
+    let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
+    (list_view, factory)
+}
+
+fn create_children(
+    parent_obj: &glib::Object,
+    state: &Rc<RefCell<AppState>>,
+) -> Option<gio::ListModel> {
+    let row_obj: &RowObject = parent_obj.downcast_ref()?;
+    let row = row_obj.row();
+    match row {
+        Row::Category { mime, handlers } => {
+            let store = gio::ListStore::new::<RowObject>();
+            // Skip handlers[0] — shown inline on the category row itself.
+            for child in model::handlers_for(&mime, &handlers).into_iter().skip(1) {
+                store.append(&RowObject::new(child));
+            }
+            for child in model::exceptions_for(&mime, state.borrow().state()) {
+                store.append(&RowObject::new(child));
+            }
+            if store.n_items() == 0 {
+                None
+            } else {
+                Some(store.upcast())
+            }
+        }
+        Row::Exception { mime, handlers } => {
+            let store = gio::ListStore::new::<RowObject>();
+            // Skip handlers[0] — shown inline on the exception row itself.
+            for child in model::handlers_for(&mime, &handlers).into_iter().skip(1) {
+                store.append(&RowObject::new(child));
+            }
+            if store.n_items() == 0 {
+                None
+            } else {
+                Some(store.upcast())
+            }
+        }
+        Row::Handler { .. } => None,
+    }
+}
+
+// Row template:
+//   [main_icon] [main_label] [spacer*hexpand] [handler_icon] [handler_label] [badge] [actions]
+// Cat/Exc rows show MIME on the left and the inline default handler on the right.
+// Handler (secondary) rows reuse main_icon/main_label for the app icon+name and hide
+// the handler_* widgets. bind_row clears+repopulates actions per variant so old click
+// handlers from recycled rows don't leak.
+fn setup_row(_factory: &gtk4::SignalListItemFactory, item: &glib::Object) {
+    let item: &gtk4::ListItem = item.downcast_ref().unwrap();
+    let expander = gtk4::TreeExpander::new();
+
+    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+
+    let main_icon = gtk4::Image::new();
+    main_icon.set_pixel_size(24);
+    row_box.append(&main_icon);
+
+    let main_label = gtk4::Label::new(None);
+    main_label.set_xalign(0.0);
+    row_box.append(&main_label);
+
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    row_box.append(&spacer);
+
+    let handler_icon = gtk4::Image::new();
+    handler_icon.set_pixel_size(20);
+    row_box.append(&handler_icon);
+
+    let handler_label = gtk4::Label::new(None);
+    handler_label.set_xalign(0.0);
+    handler_label.add_css_class("dim-label");
+    row_box.append(&handler_label);
+
+    let badge = gtk4::Label::new(None);
+    badge.set_xalign(0.0);
+    badge.add_css_class("dim-label");
+    row_box.append(&badge);
+
+    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    row_box.append(&actions);
+
+    expander.set_child(Some(&row_box));
+    item.set_child(Some(&expander));
+}
+
+struct RowWidgets {
+    main_icon: gtk4::Image,
+    main_label: gtk4::Label,
+    handler_icon: gtk4::Image,
+    handler_label: gtk4::Label,
+    badge: gtk4::Label,
+    actions: gtk4::Box,
+}
+
+fn unpack_row_widgets(expander: &gtk4::TreeExpander) -> Option<RowWidgets> {
+    let row_box = expander.child().and_then(|c| c.downcast::<gtk4::Box>().ok())?;
+    let main_icon = row_box.first_child()?.downcast::<gtk4::Image>().ok()?;
+    let main_label = main_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+    let spacer = main_label.next_sibling()?.downcast::<gtk4::Box>().ok()?;
+    let handler_icon = spacer.next_sibling()?.downcast::<gtk4::Image>().ok()?;
+    let handler_label = handler_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+    let badge = handler_label.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+    let actions = badge.next_sibling()?.downcast::<gtk4::Box>().ok()?;
+    Some(RowWidgets {
+        main_icon,
+        main_label,
+        handler_icon,
+        handler_label,
+        badge,
+        actions,
+    })
+}
+
+fn clear_actions(actions: &gtk4::Box) {
+    while let Some(child) = actions.first_child() {
+        actions.remove(&child);
+    }
+}
+
+fn make_action_btn(icon: &str, tooltip: &str) -> gtk4::Button {
+    let b = gtk4::Button::from_icon_name(icon);
+    b.add_css_class("flat");
+    b.set_tooltip_text(Some(tooltip));
+    b
+}
+
+fn bind_row(item: &glib::Object, wiring: &Wiring) {
+    let item: &gtk4::ListItem = item.downcast_ref().unwrap();
+    let Some(tree_row) = item.item().and_then(|o| o.downcast::<gtk4::TreeListRow>().ok()) else {
+        return;
+    };
+    let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else {
+        return;
+    };
+    let Some(expander) = item.child().and_then(|c| c.downcast::<gtk4::TreeExpander>().ok())
+    else {
+        return;
+    };
+    expander.set_list_row(Some(&tree_row));
+    let Some(w) = unpack_row_widgets(&expander) else {
+        return;
+    };
+    clear_actions(&w.actions);
+
+    match row_obj.row() {
+        Row::Category { mime, handlers } => {
+            set_mime_icon(&w.main_icon, &strip_wildcard(&mime));
+            w.main_label.set_text(&mime);
+            set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
+            w.badge.set_text("");
+
+            if !handlers.is_empty() {
+                w.actions.append(&pick_btn(
+                    "document-edit-symbolic",
+                    "Change default",
+                    wiring,
+                    {
+                        let mime = mime.clone();
+                        let handlers = handlers.clone();
+                        move |desktop| undo::set_category_default(&mime, &desktop, &handlers)
+                    },
+                ));
+            }
+            w.actions.append(&pick_btn("list-add-symbolic", "Add handler", wiring, {
+                let mime = mime.clone();
+                let handlers_empty = handlers.is_empty();
+                move |desktop| {
+                    if handlers_empty {
+                        undo::set_category_default(&mime, &desktop, &[])
+                    } else {
+                        undo::add_handler(&mime, &desktop)
+                    }
+                }
+            }));
+            let except = make_action_btn("mail-message-new-symbolic", "Add exception");
+            let wiring_cl = wiring.clone();
+            except.connect_clicked(move |_| open_add_exception_dialog(&wiring_cl, &mime));
+            w.actions.append(&except);
+        }
+        Row::Exception { mime, handlers } => {
+            set_mime_icon(&w.main_icon, &mime);
+            w.main_label.set_text(&mime);
+            set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
+            w.badge.set_text("(exception)");
+
+            w.actions.append(&pick_btn(
+                "document-edit-symbolic",
+                "Change default",
+                wiring,
+                {
+                    let mime = mime.clone();
+                    let handlers = handlers.clone();
+                    move |desktop| undo::set_category_default(&mime, &desktop, &handlers)
+                },
+            ));
+            w.actions.append(&simple_btn(
+                "user-trash-symbolic",
+                "Remove exception",
+                wiring,
+                move || undo::remove_exception(&mime, &handlers),
+            ));
+        }
+        Row::Handler { mime, desktop, index, .. } => {
+            let info = gio::DesktopAppInfo::new(&desktop);
+            if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
+                w.main_icon.set_from_gicon(&g);
+            } else {
+                w.main_icon.set_icon_name(Some("applications-other-symbolic"));
+            }
+            w.main_label.set_text(&handler_display_name(&desktop, info.as_ref()));
+            w.handler_icon.set_visible(false);
+            w.handler_label.set_text("");
+            w.badge.set_text("");
+            // create_children only emits index >= 1, but be defensive: index 0 has no action.
+            if index > 0 {
+                w.actions.append(&simple_btn(
+                    "user-trash-symbolic",
+                    "Remove handler",
+                    wiring,
+                    move || undo::remove_handler(&mime, &desktop),
+                ));
+            }
+        }
+    }
+}
+
+// Render the inline "default handler" segment on a Category/Exception row.
+// `desktop` is the .desktop filename of the default handler, or None for an empty category.
+fn set_handler_inline(icon: &gtk4::Image, label: &gtk4::Label, desktop: Option<&str>) {
+    match desktop {
+        Some(d) => {
+            let info = gio::DesktopAppInfo::new(d);
+            if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
+                icon.set_from_gicon(&g);
+            } else {
+                icon.set_icon_name(Some("applications-other-symbolic"));
+            }
+            icon.set_visible(true);
+            label.set_text(&handler_display_name(d, info.as_ref()));
+        }
+        None => {
+            icon.set_visible(false);
+            label.set_text("(no default)");
+        }
+    }
+}
+
+// Resolve a .desktop filename to a human name. Fallback intentionally differs from
+// handlr::humanize: we keep the full reverse-DNS id (e.g. "org.gnome.Nautilus") so the
+// user sees what failed to resolve, rather than the capitalized last component.
+fn handler_display_name(desktop: &str, info: Option<&gio::DesktopAppInfo>) -> String {
+    info.map(|a| a.name().to_string())
+        .unwrap_or_else(|| desktop.strip_suffix(".desktop").unwrap_or(desktop).to_string())
+}
+
+// Build an action button that opens the picker and applies an UndoEntry derived from
+// the chosen desktop. `make_entry` is called once per pick.
+fn pick_btn<F>(icon: &str, tooltip: &str, wiring: &Wiring, make_entry: F) -> gtk4::Button
+where
+    F: Fn(String) -> UndoEntry + Clone + 'static,
+{
+    let btn = make_action_btn(icon, tooltip);
+    let wiring = wiring.clone();
+    btn.connect_clicked(move |b| {
+        let wiring_inner = wiring.clone();
+        let make_entry = make_entry.clone();
+        let apps = system_apps(&wiring);
+        show_app_picker(b.upcast_ref::<gtk4::Widget>(), &apps, move |desktop| {
+            apply_entry(&wiring_inner, make_entry(desktop));
+        });
+    });
+    btn
+}
+
+// Build an action button that synchronously builds & applies an UndoEntry on click.
+fn simple_btn<F>(icon: &str, tooltip: &str, wiring: &Wiring, make_entry: F) -> gtk4::Button
+where
+    F: Fn() -> UndoEntry + 'static,
+{
+    let btn = make_action_btn(icon, tooltip);
+    let wiring = wiring.clone();
+    btn.connect_clicked(move |_| apply_entry(&wiring, make_entry()));
+    btn
+}
+
+fn system_apps(wiring: &Wiring) -> Vec<handlr::App> {
+    wiring
+        .state
+        .borrow()
+        .state()
+        .system_apps
+        .iter()
+        .map(|a| handlr::App {
+            desktop: a.desktop.clone(),
+            name: a.name.clone(),
+        })
+        .collect()
+}
+
+fn set_mime_icon(image: &gtk4::Image, mime: &str) {
+    let icon = gio::functions::content_type_get_icon(mime);
+    image.set_from_gicon(&icon);
+}
+
+fn strip_wildcard(mime: &str) -> String {
+    // "video/*" -> "video/x-generic" (freedesktop's generic icon convention).
+    if let Some(top) = mime.strip_suffix("/*") {
+        format!("{}/x-generic", top)
+    } else {
+        mime.to_string()
+    }
+}
+
+// --- App picker popover ---------------------------------------------------------------
+
+fn show_app_picker(
+    anchor: &gtk4::Widget,
+    apps: &[handlr::App],
+    on_chosen: impl Fn(String) + 'static,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_autohide(true);
+    popover.set_parent(anchor);
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    vbox.set_size_request(320, -1);
+
+    let search = gtk4::SearchEntry::new();
+    vbox.append(&search);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_min_content_height(280);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+
+    let store = gio::ListStore::new::<AppObject>();
+    for a in apps {
+        store.append(&AppObject::new(handlr::App {
+            desktop: a.desktop.clone(),
+            name: a.name.clone(),
+        }));
+    }
+
+    let search_for_filter = search.clone();
+    let filter = gtk4::CustomFilter::new(move |obj: &glib::Object| {
+        let Some(ao) = obj.downcast_ref::<AppObject>() else {
+            return false;
+        };
+        let needle = search_for_filter.text().to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        ao.name().to_lowercase().contains(&needle)
+            || ao.desktop().to_lowercase().contains(&needle)
+    });
+
+    let filter_model = gtk4::FilterListModel::new(Some(store), Some(filter.clone()));
+    let selection = gtk4::SingleSelection::new(Some(filter_model));
+
+    // Re-run filter on every keystroke.
+    {
+        let filter = filter.clone();
+        search.connect_search_changed(move |_| filter.changed(gtk4::FilterChange::Different));
+    }
+
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(|_factory, item| {
+        let item: &gtk4::ListItem = item.downcast_ref().unwrap();
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let image = gtk4::Image::new();
+        image.set_pixel_size(24);
+        let label = gtk4::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        row.append(&image);
+        row.append(&label);
+        item.set_child(Some(&row));
+    });
+    factory.connect_bind(|_factory, item| {
+        let item: &gtk4::ListItem = item.downcast_ref().unwrap();
+        let (Some(app_obj), Some(row)) = (
+            item.item().and_then(|o| o.downcast::<AppObject>().ok()),
+            item.child().and_then(|c| c.downcast::<gtk4::Box>().ok()),
+        ) else {
+            return;
+        };
+        let (Some(image), Some(label)) = (
+            row.first_child().and_then(|w| w.downcast::<gtk4::Image>().ok()),
+            row.first_child()
+                .and_then(|w| w.next_sibling())
+                .and_then(|w| w.downcast::<gtk4::Label>().ok()),
+        ) else {
+            return;
+        };
+        let icon = gio::DesktopAppInfo::new(&app_obj.desktop()).and_then(|i| i.icon());
+        match icon {
+            Some(g) => image.set_from_gicon(&g),
+            None => image.set_icon_name(Some("applications-other-symbolic")),
+        }
+        label.set_text(&app_obj.name());
+    });
+
+    let list_view = gtk4::ListView::new(Some(selection.clone()), Some(factory));
+    list_view.set_single_click_activate(true);
+    scrolled.set_child(Some(&list_view));
+    vbox.append(&scrolled);
+
+    popover.set_child(Some(&vbox));
+
+    {
+        let popover = popover.clone();
+        list_view.connect_activate(move |lv, pos| {
+            let Some(app_obj) = lv
+                .model()
+                .and_then(|m| m.item(pos))
+                .and_then(|o| o.downcast::<AppObject>().ok())
+            else {
+                return;
+            };
+            popover.popdown();
+            on_chosen(app_obj.desktop());
+        });
+    }
+
+    // Enter in the search entry activates the first visible item.
+    {
+        let lv = list_view.clone();
+        search.connect_activate(move |_| {
+            if let Some(model) = lv.model()
+                && model.n_items() > 0
+            {
+                let _ = lv.activate_action(
+                    "list.activate-item",
+                    Some(&glib::Variant::from(0u32)),
+                );
+            }
+        });
+    }
+
+    // Down arrow in the search entry forwards focus to the list view so the standard
+    // ListView keybindings (Up/Down/Enter) take over.
+    {
+        let lv = list_view.clone();
+        let selection = selection.clone();
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Down {
+                if selection.n_items() > 0 {
+                    selection.set_selected(0);
+                }
+                lv.grab_focus();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        search.add_controller(key_ctrl);
+    }
+
+    // Drop the popover (and its parent reference) when it closes so it doesn't leak.
+    popover.connect_closed(|p| p.unparent());
+
+    popover.popup();
+    search.grab_focus();
+}
+
+// --- Add-exception dialog -------------------------------------------------------------
+
+fn open_add_exception_dialog(wiring: &Wiring, category_mime: &str) {
+    let prefix = category_mime
+        .strip_suffix("/*")
+        .map(|p| format!("{}/", p))
+        .unwrap_or_default();
+
+    let dialog = gtk4::Window::builder()
+        .title("Add exception")
+        .transient_for(&wiring.window)
+        .modal(true)
+        .default_width(360)
+        .build();
+
+    let vbox = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let prompt = gtk4::Label::builder()
+        .label(format!(
+            "Enter the exact MIME type to add as an exception under {}, or pick a file to detect it:",
+            category_mime
+        ))
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+
+    let entry_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let entry = gtk4::Entry::builder()
+        .placeholder_text(format!("{}example", prefix))
+        .text(&prefix)
+        .hexpand(true)
+        .build();
+    entry.set_position(prefix.len() as i32);
+    let from_file = gtk4::Button::with_label("From file…");
+    from_file.set_tooltip_text(Some("Pick a file and use its detected MIME type"));
+    entry_row.append(&entry);
+    entry_row.append(&from_file);
+
+    let error_label = gtk4::Label::new(None);
+    error_label.set_visible(false);
+    error_label.set_xalign(0.0);
+    error_label.add_css_class("error");
+
+    let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    buttons.set_halign(gtk4::Align::End);
+    let cancel = gtk4::Button::with_label("Cancel");
+    let next = gtk4::Button::with_label("Choose app…");
+    next.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&next);
+
+    vbox.append(&prompt);
+    vbox.append(&entry_row);
+    vbox.append(&error_label);
+    vbox.append(&buttons);
+    dialog.set_child(Some(&vbox));
+
+    {
+        let dialog_parent = dialog.clone();
+        let entry = entry.clone();
+        let error_label = error_label.clone();
+        from_file.connect_clicked(move |_| {
+            let file_dialog = gtk4::FileDialog::builder()
+                .title("Pick a file to detect its MIME type")
+                .modal(true)
+                .build();
+            let entry = entry.clone();
+            let error_label = error_label.clone();
+            file_dialog.open(Some(&dialog_parent), gio::Cancellable::NONE, move |result| {
+                let Ok(file) = result else { return }; // user cancelled
+                let Some(path) = file.path() else { return };
+                match handlr::detect_mime(&path) {
+                    Ok(mime) => {
+                        entry.set_text(&mime);
+                        entry.set_position(mime.len() as i32);
+                        error_label.set_visible(false);
+                    }
+                    Err(e) => {
+                        error_label.set_text(&format!("Failed to detect MIME: {}", e));
+                        error_label.set_visible(true);
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+
+    let proceed = {
+        let dialog = dialog.clone();
+        let entry = entry.clone();
+        let next_btn = next.clone();
+        let wiring = wiring.clone();
+        let error_label = error_label.clone();
+        move || {
+            let mime = entry.text().trim().to_string();
+            if mime.is_empty() || mime.ends_with('*') || !mime.contains('/') {
+                error_label.set_text("Enter a MIME like `video/mp4`");
+                error_label.set_visible(true);
+                return;
+            }
+            let prior: Vec<String> = wiring
+                .state
+                .borrow()
+                .state()
+                .defaults
+                .iter()
+                .find(|(m, _)| m == &mime)
+                .map(|(_, h)| h.clone())
+                .unwrap_or_default();
+            let wiring_inner = wiring.clone();
+            let dialog_inner = dialog.clone();
+            let apps = system_apps(&wiring);
+            show_app_picker(next_btn.upcast_ref::<gtk4::Widget>(), &apps, move |d| {
+                apply_entry(&wiring_inner, undo::add_exception(&mime, &d, &prior));
+                dialog_inner.close();
+            });
+        }
+    };
+
+    next.connect_clicked({
+        let proceed = proceed.clone();
+        move |_| proceed()
+    });
+    entry.connect_activate(move |_| proceed());
+
+    dialog.present();
+    entry.grab_focus();
+}
