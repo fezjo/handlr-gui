@@ -114,7 +114,6 @@ pub(crate) fn build_window(
     state: Rc<RefCell<AppState>>,
     config: Rc<RefCell<crate::config::Config>>,
 ) -> (gtk4::ApplicationWindow, TreeHandle) {
-    let _ = config;
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title("handlr-gui")
@@ -140,6 +139,15 @@ pub(crate) fn build_window(
     redo_btn.set_sensitive(false);
     header.pack_start(&redo_btn);
 
+    // Outer tab stack: Defaults (tree) | Regex Handlers (stub).
+    let main_tabs = gtk4::Stack::new();
+    main_tabs.set_vexpand(true);
+
+    let switcher = gtk4::StackSwitcher::new();
+    switcher.set_stack(Some(&main_tabs));
+    header.set_title_widget(Some(&switcher));
+
+    // Pack end items right-to-left: hamburger | gear | reload (left to right in header).
     let menu = gio::Menu::new();
     menu.append(Some("About"), Some("win.about"));
     menu.append(Some("Quit"), Some("win.quit"));
@@ -147,6 +155,10 @@ pub(crate) fn build_window(
     menu_btn.set_icon_name("open-menu-symbolic");
     menu_btn.set_menu_model(Some(&menu));
     header.pack_end(&menu_btn);
+
+    let gear_btn = gtk4::Button::from_icon_name("preferences-system-symbolic");
+    gear_btn.set_tooltip_text(Some("Settings"));
+    header.pack_end(&gear_btn);
 
     let reload_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
     reload_btn.set_tooltip_text(Some("Reload"));
@@ -198,7 +210,16 @@ pub(crate) fn build_window(
     empty_box.append(&empty_label);
     stack.add_named(&empty_box, Some("empty"));
 
-    vbox.append(&stack);
+    // Wrap inner stack in a named page of main_tabs.
+    main_tabs.add_titled(&stack, Some("defaults"), "Defaults");
+
+    let regex_stub = gtk4::Label::new(Some("Coming soon"));
+    regex_stub.add_css_class("dim-label");
+    regex_stub.set_halign(gtk4::Align::Center);
+    regex_stub.set_valign(gtk4::Align::Center);
+    main_tabs.add_titled(&regex_stub, Some("regex-handlers"), "Regex Handlers");
+
+    vbox.append(&main_tabs);
 
     // Initial population + header sensitivity.
     refresh_view(&wiring);
@@ -264,6 +285,31 @@ pub(crate) fn build_window(
     });
 
     install_shortcuts(&window);
+
+    // Settings dialog — single instance, present() if already open.
+    let settings_win: Rc<RefCell<Option<gtk4::Window>>> = Rc::new(RefCell::new(None));
+    {
+        let window = window.clone();
+        let config = config.clone();
+        let settings_win = settings_win.clone();
+        gear_btn.connect_clicked(move |_| {
+            let mut opt = settings_win.borrow_mut();
+            if let Some(existing) = opt.as_ref() {
+                existing.present();
+                return;
+            }
+            let dlg = build_settings_dialog(&window, config.clone());
+            dlg.connect_close_request({
+                let settings_win = settings_win.clone();
+                move |_| {
+                    *settings_win.borrow_mut() = None;
+                    glib::Propagation::Proceed
+                }
+            });
+            dlg.present();
+            *opt = Some(dlg);
+        });
+    }
 
     // Delete on the focused tree row: clear/remove per §6.
     {
@@ -1143,4 +1189,212 @@ fn open_add_exception_dialog(wiring: &Wiring, category_mime: &str) {
 
     dialog.present();
     entry.grab_focus();
+}
+
+// --- Settings dialog ------------------------------------------------------------------
+
+fn build_settings_dialog(
+    parent: &gtk4::ApplicationWindow,
+    config: Rc<RefCell<crate::config::Config>>,
+) -> gtk4::Window {
+    let dlg = gtk4::Window::builder()
+        .title("Settings")
+        .transient_for(parent)
+        .modal(false)
+        .default_width(420)
+        .build();
+
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    outer.set_margin_top(16);
+    outer.set_margin_bottom(16);
+    outer.set_margin_start(16);
+    outer.set_margin_end(16);
+    dlg.set_child(Some(&outer));
+
+    // Error label (hidden unless save fails).
+    let err_label = gtk4::Label::new(None);
+    err_label.add_css_class("error");
+    err_label.set_wrap(true);
+    err_label.set_visible(false);
+
+    // ── Selector section ─────────────────────────────────────────────────────
+    outer.append(&section_label("Selector"));
+    let selector_box = gtk4::ListBox::new();
+    selector_box.set_selection_mode(gtk4::SelectionMode::None);
+    selector_box.add_css_class("boxed-list");
+    outer.append(&selector_box);
+
+    // Row 1: enable_selector (switch)
+    let enable_switch = gtk4::Switch::new();
+    enable_switch.set_active(config.borrow().enable_selector);
+    enable_switch.set_valign(gtk4::Align::Center);
+    let enable_row = switch_row(
+        "Enable selector",
+        "Show picker when multiple handlers match",
+        &enable_switch,
+    );
+    selector_box.append(&enable_row);
+
+    // Row 2: selector command (entry, full-width below titles)
+    let selector_entry = gtk4::Entry::new();
+    selector_entry.set_text(&config.borrow().selector);
+    selector_entry.set_sensitive(config.borrow().enable_selector);
+    let selector_row = entry_row(
+        "Selector command",
+        "Shell command used as the interactive picker",
+        &selector_entry,
+    );
+    selector_box.append(&selector_row);
+
+    // ── Terminal section ──────────────────────────────────────────────────────
+    outer.append(&section_label("Terminal"));
+    let terminal_box = gtk4::ListBox::new();
+    terminal_box.set_selection_mode(gtk4::SelectionMode::None);
+    terminal_box.add_css_class("boxed-list");
+    outer.append(&terminal_box);
+
+    let term_entry = gtk4::Entry::new();
+    term_entry.set_text(&config.borrow().term_exec_args);
+    let term_row = entry_row(
+        "Terminal exec args",
+        "Flag passed to terminal emulator for terminal handlers (default: -e)",
+        &term_entry,
+    );
+    terminal_box.append(&term_row);
+
+    // ── MIME section ──────────────────────────────────────────────────────────
+    outer.append(&section_label("MIME"));
+    let mime_box = gtk4::ListBox::new();
+    mime_box.set_selection_mode(gtk4::SelectionMode::None);
+    mime_box.add_css_class("boxed-list");
+    outer.append(&mime_box);
+
+    let wildcard_switch = gtk4::Switch::new();
+    wildcard_switch.set_active(config.borrow().expand_wildcards);
+    wildcard_switch.set_valign(gtk4::Align::Center);
+    let wildcard_row = switch_row(
+        "Expand wildcards",
+        "Expand video/* to individual MIME types when writing mimeapps.list",
+        &wildcard_switch,
+    );
+    mime_box.append(&wildcard_row);
+
+    outer.append(&err_label);
+
+    // ── Live-apply callbacks ──────────────────────────────────────────────────
+
+    // enable_selector toggle: update config, dim selector entry, save.
+    {
+        let config = config.clone();
+        let selector_entry = selector_entry.clone();
+        let err_label = err_label.clone();
+        enable_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            config.borrow_mut().enable_selector = active;
+            selector_entry.set_sensitive(active);
+            apply_config_save(&config, &err_label);
+        });
+    }
+
+    // selector entry: save on every keystroke.
+    {
+        let config = config.clone();
+        let err_label = err_label.clone();
+        selector_entry.connect_changed(move |entry| {
+            config.borrow_mut().selector = entry.text().to_string();
+            apply_config_save(&config, &err_label);
+        });
+    }
+
+    // term_exec_args entry.
+    {
+        let config = config.clone();
+        let err_label = err_label.clone();
+        term_entry.connect_changed(move |entry| {
+            config.borrow_mut().term_exec_args = entry.text().to_string();
+            apply_config_save(&config, &err_label);
+        });
+    }
+
+    // expand_wildcards switch.
+    {
+        let config = config.clone();
+        let err_label = err_label.clone();
+        wildcard_switch.connect_active_notify(move |sw| {
+            config.borrow_mut().expand_wildcards = sw.is_active();
+            apply_config_save(&config, &err_label);
+        });
+    }
+
+    dlg
+}
+
+fn apply_config_save(
+    config: &Rc<RefCell<crate::config::Config>>,
+    err_label: &gtk4::Label,
+) {
+    match crate::config::save(&config.borrow()) {
+        Ok(()) => err_label.set_visible(false),
+        Err(e) => {
+            err_label.set_text(&format!("Save failed: {e}"));
+            err_label.set_visible(true);
+        }
+    }
+}
+
+fn section_label(text: &str) -> gtk4::Label {
+    let label = gtk4::Label::new(Some(text));
+    label.set_halign(gtk4::Align::Start);
+    label.add_css_class("heading");
+    label
+}
+
+fn switch_row(title: &str, subtitle: &str, switch: &gtk4::Switch) -> gtk4::ListBoxRow {
+    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    row_box.set_margin_top(8);
+    row_box.set_margin_bottom(8);
+    row_box.set_margin_start(8);
+    row_box.set_margin_end(8);
+
+    let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    text_box.set_hexpand(true);
+    let title_label = gtk4::Label::new(Some(title));
+    title_label.set_halign(gtk4::Align::Start);
+    let sub_label = gtk4::Label::new(Some(subtitle));
+    sub_label.set_halign(gtk4::Align::Start);
+    sub_label.add_css_class("dim-label");
+    sub_label.set_wrap(true);
+    text_box.append(&title_label);
+    text_box.append(&sub_label);
+
+    row_box.append(&text_box);
+    row_box.append(switch);
+
+    let row = gtk4::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_child(Some(&row_box));
+    row
+}
+
+fn entry_row(title: &str, subtitle: &str, entry: &gtk4::Entry) -> gtk4::ListBoxRow {
+    let row_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    row_box.set_margin_top(8);
+    row_box.set_margin_bottom(8);
+    row_box.set_margin_start(8);
+    row_box.set_margin_end(8);
+
+    let title_label = gtk4::Label::new(Some(title));
+    title_label.set_halign(gtk4::Align::Start);
+    let sub_label = gtk4::Label::new(Some(subtitle));
+    sub_label.set_halign(gtk4::Align::Start);
+    sub_label.add_css_class("dim-label");
+    sub_label.set_wrap(true);
+    row_box.append(&title_label);
+    row_box.append(&sub_label);
+    row_box.append(entry);
+
+    let row = gtk4::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_child(Some(&row_box));
+    row
 }
