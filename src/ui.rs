@@ -800,6 +800,11 @@ fn clear_actions(actions: &gtk4::Box) {
     }
 }
 
+fn set_badge(badge: &gtk4::Label, text: &str) {
+    badge.set_text(text);
+    badge.set_visible(!text.is_empty());
+}
+
 fn make_action_btn(icon: &str, tooltip: &str) -> gtk4::Button {
     let b = gtk4::Button::from_icon_name(icon);
     b.add_css_class("flat");
@@ -845,7 +850,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                 &w.handler_label,
                 handlers.first().map(String::as_str),
             );
-            w.badge.set_text("");
+            set_badge(&w.badge, "");
 
             if !handlers.is_empty() {
                 w.actions.append(&pick_btn(
@@ -895,7 +900,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
 
             if handlers.is_empty() {
                 // Pending (not yet configured in handlr). Offer Remove and Set.
-                w.badge.set_text("");
+                set_badge(&w.badge, "");
                 w.actions.append(&simple_btn(
                     "user-trash-symbolic",
                     "Remove exception",
@@ -911,7 +916,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                         move |desktop| undo::add_exception(&mime, &desktop, &[])
                     }));
             } else {
-                w.badge.set_text("");
+                set_badge(&w.badge, "");
                 w.actions.append(&pick_btn(
                     "document-edit-symbolic",
                     "Change default",
@@ -958,7 +963,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             w.handler_icon.set_visible(true);
             w.handler_label
                 .set_text(&handler_display_name(&desktop, info.as_ref()));
-            w.badge.set_text("Alternative");
+            set_badge(&w.badge, "Alternative");
             // create_children only emits index >= 1, but be defensive: index 0 has no action.
             if index > 0 {
                 let up_btn = make_action_btn("go-up-symbolic", "Promote handler");
@@ -994,7 +999,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             w.main_label.set_text("");
             w.handler_icon.set_visible(false);
             w.handler_label.set_text("");
-            w.badge.set_text("");
+            set_badge(&w.badge, "");
             let btn = gtk4::Button::with_label("＋  Add exception");
             btn.add_css_class("flat");
             let wiring_cl = wiring.clone();
