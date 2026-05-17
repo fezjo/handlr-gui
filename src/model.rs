@@ -28,6 +28,16 @@ pub(crate) const SEED_CATEGORIES: &[&str] = &[
     "text/*",
     "application/*",
     "inode/*",
+    "x-scheme-handler/*",
+];
+
+// Exact-MIME entries that always appear as exception rows (with empty handlers when not
+// configured), so users can find and set them without knowing the MIME name.
+const SEED_EXCEPTIONS: &[&str] = &[
+    "x-scheme-handler/http",
+    "x-scheme-handler/https",
+    "x-scheme-handler/mailto",
+    "x-scheme-handler/magnet",
 ];
 
 pub(crate) fn build_categories(state: &handlr::State) -> Vec<Row> {
@@ -52,17 +62,27 @@ pub(crate) fn build_categories(state: &handlr::State) -> Vec<Row> {
 pub(crate) fn exceptions_for(category_mime: &str, state: &handlr::State) -> Vec<Row> {
     debug_assert!(category_mime.ends_with("/*"));
     let prefix = category_mime.strip_suffix('*').unwrap_or(category_mime);
-    let mut out: Vec<(&str, &Vec<String>)> = state
-        .defaults
-        .iter()
-        .filter(|(mime, _)| !mime.ends_with('*') && mime.starts_with(prefix))
-        .map(|(m, h)| (m.as_str(), h))
-        .collect();
-    out.sort_by_key(|(m, _)| *m);
-    out.into_iter()
+
+    // BTreeMap keeps entries sorted by MIME and lets seeds fill in gaps.
+    // Value is None for seed placeholders (no handler), Some for configured entries.
+    let mut map: std::collections::BTreeMap<&str, Option<&Vec<String>>> =
+        std::collections::BTreeMap::new();
+
+    for (mime, handlers) in &state.defaults {
+        if !mime.ends_with('*') && mime.starts_with(prefix) {
+            map.insert(mime.as_str(), Some(handlers));
+        }
+    }
+    for &seed in SEED_EXCEPTIONS {
+        if seed.starts_with(prefix) {
+            map.entry(seed).or_insert(None);
+        }
+    }
+
+    map.into_iter()
         .map(|(mime, handlers)| Row::Exception {
             mime: mime.to_string(),
-            handlers: handlers.clone(),
+            handlers: handlers.cloned().unwrap_or_default(),
         })
         .collect()
 }
@@ -102,6 +122,17 @@ impl AppState {
 
     pub(crate) fn set_state(&mut self, s: handlr::State) {
         self.state = s;
+    }
+
+    // Add a placeholder (mime, []) entry so the tree shows the MIME under its category
+    // even though no handler has been configured yet. The placeholder is purely in-memory;
+    // it disappears after the next rebuild from handlr (any action or Reload). This lets
+    // the user see the entry in context and click "Set handler" to make it permanent.
+    pub(crate) fn add_pending_exception(&mut self, mime: String) {
+        let already = self.state.defaults.iter().any(|(m, _)| m == &mime);
+        if !already {
+            self.state.defaults.push((mime, Vec::new()));
+        }
     }
 
     pub(crate) fn can_undo(&self) -> bool {

@@ -15,10 +15,12 @@ pub(crate) fn install(
 ) {
     install_hover_css(window);
 
-    // Accept both FileList (Wayland-friendly: maps from text/uri-list, the standard
-    // file-manager drop format) and bare GFile. GTK negotiates whichever the source offers.
-    let target = gtk4::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    // Accept FileList (text/uri-list, the standard file-manager format) and bare GFile.
+    // Some sources only offer MOVE/LINK, so accept all actions and pick COPY when prompted.
+    let actions = gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK;
+    let target = gtk4::DropTarget::new(gdk::FileList::static_type(), actions);
     target.set_types(&[gdk::FileList::static_type(), gio::File::static_type()]);
+    target.set_preload(true);
 
     {
         let window = window.clone();
@@ -38,10 +40,7 @@ pub(crate) fn install(
         let window = window.clone();
         target.connect_drop(move |_, value, _, _| {
             window.remove_css_class("drop-active");
-            // Spec §7: process only the first file. We only registered GFile as the
-            // accepted type, so GTK hands us a single GFile here.
-            let path = extract_first_path(value);
-            match path {
+            match extract_first_path(value) {
                 Some(p) => {
                     on_drop(p);
                     true
@@ -51,7 +50,14 @@ pub(crate) fn install(
         });
     }
 
-    window.add_controller(target);
+    // Attach to the window's content child rather than the window itself: on Wayland,
+    // controllers on the bare ApplicationWindow sometimes don't see drops over the
+    // content area. The child Box covers the same area but participates in the normal
+    // input region.
+    let host: gtk4::Widget = window
+        .child()
+        .unwrap_or_else(|| window.clone().upcast::<gtk4::Widget>());
+    host.add_controller(target);
 }
 
 fn extract_first_path(value: &glib::Value) -> Option<PathBuf> {
