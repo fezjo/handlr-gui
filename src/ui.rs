@@ -182,10 +182,7 @@ pub(crate) fn build_window(
 
     window.set_titlebar(Some(&header));
 
-    // Error info bar wrapped in a revealer. InfoBar is deprecated since GTK 4.10
-    // but it's the spec'd widget and there's no drop-in replacement in v1.
-    #[allow(deprecated)]
-    let (revealer, info_label) = build_info_bar(&vbox);
+    let (revealer, info_label) = build_error_banner(&vbox);
 
     // Stack to flip between populated tree and the empty placeholder.
     let stack = gtk4::Stack::new();
@@ -217,12 +214,20 @@ pub(crate) fn build_window(
     scrolled.set_child(Some(&list_view));
     stack.add_named(&scrolled, Some("tree"));
 
-    let empty_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let empty_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     empty_box.set_halign(gtk4::Align::Center);
     empty_box.set_valign(gtk4::Align::Center);
+    let empty_icon = gtk4::Image::from_icon_name(
+        "preferences-desktop-default-applications-symbolic",
+    );
+    empty_icon.set_pixel_size(64);
+    empty_icon.add_css_class("dim-label");
+    empty_box.append(&empty_icon);
     let empty_label = gtk4::Label::new(Some(
-        "No defaults configured. Drop a file here or use the CLI to add one.",
+        "No defaults configured.\nDrop a file here or use the CLI to add one.",
     ));
+    empty_label.set_justify(gtk4::Justification::Center);
+    empty_label.add_css_class("dim-label");
     empty_box.append(&empty_label);
     stack.add_named(&empty_box, Some("empty"));
 
@@ -519,23 +524,33 @@ fn install_shortcuts(window: &gtk4::ApplicationWindow) {
     window.add_controller(controller);
 }
 
-#[allow(deprecated)]
-fn build_info_bar(vbox: &gtk4::Box) -> (gtk4::Revealer, gtk4::Label) {
+fn build_error_banner(vbox: &gtk4::Box) -> (gtk4::Revealer, gtk4::Label) {
     let revealer = gtk4::Revealer::new();
     revealer.set_reveal_child(false);
-    let info_bar = gtk4::InfoBar::new();
-    info_bar.set_message_type(gtk4::MessageType::Error);
-    info_bar.set_show_close_button(true);
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+
+    let banner = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    banner.add_css_class("error-banner");
+
+    let icon = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    icon.add_css_class("error-banner-icon");
+    banner.append(&icon);
+
     let info_label = gtk4::Label::new(None);
     info_label.set_xalign(0.0);
     info_label.set_wrap(true);
-    info_bar.add_child(&info_label);
-    revealer.set_child(Some(&info_bar));
-    vbox.append(&revealer);
+    info_label.set_hexpand(true);
+    banner.append(&info_label);
 
+    let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+    close_btn.add_css_class("flat");
+    close_btn.set_tooltip_text(Some("Dismiss"));
     let revealer_clone = revealer.clone();
-    info_bar.connect_response(move |_, _| revealer_clone.set_reveal_child(false));
+    close_btn.connect_clicked(move |_| revealer_clone.set_reveal_child(false));
+    banner.append(&close_btn);
 
+    revealer.set_child(Some(&banner));
+    vbox.append(&revealer);
     (revealer, info_label)
 }
 
@@ -657,6 +672,7 @@ fn build_list_view(
     factory.connect_setup(setup_row);
 
     let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
+    list_view.add_css_class("defaults-list");
     (list_view, factory)
 }
 
@@ -732,6 +748,7 @@ fn setup_row(_factory: &gtk4::SignalListItemFactory, item: &glib::Object) {
     let badge = gtk4::Label::new(None);
     badge.set_xalign(0.0);
     badge.add_css_class("dim-label");
+    badge.add_css_class("mime-badge");
     row_box.append(&badge);
 
     let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
@@ -1064,14 +1081,32 @@ fn system_apps(wiring: &Wiring) -> Vec<handlr::App> {
         .collect()
 }
 
-// Load CSS that colours MIME labels by row variant using named theme colours.
-// @accent_color and @success_color are defined by Adwaita and most GTK4 themes,
-// so the palette adapts when the user switches themes.
+// Load CSS using only GTK theme variables so the app adapts to any theme.
 fn init_row_css(window: &gtk4::ApplicationWindow) {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(
-        ".mime-category { color: @accent_color; }\
-         .mime-exception { color: @success_color; }",
+        // MIME label colours from theme palette.
+        ".mime-category { color: @accent_color; font-weight: bold; }\
+         .mime-exception { color: @success_color; }\
+         \
+         /* Pill badge: shape only, colour from theme currentColor. */\
+         .mime-badge {\
+             border-radius: 9999px;\
+             border: 1px solid alpha(currentColor, 0.35);\
+             padding: 0px 7px;\
+             font-size: 0.8em;\
+         }\
+         \
+         /* Error banner box replacing deprecated GtkInfoBar. */\
+         .error-banner {\
+             background-color: alpha(@error_color, 0.12);\
+             border-bottom: 1px solid alpha(@error_color, 0.35);\
+             padding: 6px 10px;\
+         }\
+         .error-banner-icon { color: @error_color; }\
+         \
+         /* Extra breathing room in tree rows. */\
+         .defaults-list row { min-height: 36px; }",
     );
     #[allow(deprecated)]
     gtk4::style_context_add_provider_for_display(
