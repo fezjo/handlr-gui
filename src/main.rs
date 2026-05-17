@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 fn main() -> glib::ExitCode {
     let app = gtk4::Application::builder()
-        .application_id("com.github.handlrgui")
+        .application_id("com.github.fezjo.handlr-gui")
         .build();
     app.connect_activate(on_activate);
     app.run()

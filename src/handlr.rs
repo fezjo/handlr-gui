@@ -145,7 +145,6 @@ fn map_state(raw: RawListAll) -> State {
     State { defaults, system_apps }
 }
 
-// TODO(module-3): replace humanize() with gio::DesktopAppInfo::from_filename().name() once we're in GTK context.
 fn humanize(desktop: &str) -> String {
     let stem = desktop.strip_suffix(".desktop").unwrap_or(desktop);
     let last = stem.rsplit('.').next().unwrap_or(stem);
