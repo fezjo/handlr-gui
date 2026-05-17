@@ -674,6 +674,7 @@ fn build_list_view(
 
     let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
     list_view.add_css_class("defaults-list");
+    list_view.set_show_separators(true);
     (list_view, factory)
 }
 
@@ -1112,7 +1113,17 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
          .error-banner-icon { color: @error_color; }\
          \
          /* Extra breathing room in tree rows. */\
-         .defaults-list row { min-height: 36px; }",
+         .defaults-list row { min-height: 36px; }\
+         \
+         /* Ensure handler cards always have a visible border across all themes. */\
+         .card {\
+             border: 1px solid alpha(currentColor, 0.12);\
+             border-radius: 12px;\
+         }\
+         .new-handler-card {\
+             border-style: dashed;\
+             border-color: alpha(currentColor, 0.25);\
+         }",
     );
     #[allow(deprecated)]
     gtk4::style_context_add_provider_for_display(
@@ -1742,16 +1753,6 @@ pub(crate) fn build_regex_handlers_tab(
         });
     }
 
-    let css = gtk4::CssProvider::new();
-    css.load_from_string(
-        ".new-handler-card { border: 1px dashed alpha(currentColor, 0.3); border-radius: 12px; }",
-    );
-    #[allow(deprecated)]
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().expect("display"),
-        &css,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
 
     let refresh = {
         let cards_box = cards_box.clone();
