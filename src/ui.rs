@@ -819,6 +819,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
 
     match row_obj.row() {
         Row::Category { mime, handlers } => {
+            w.main_icon.set_visible(true);
             set_mime_icon(&w.main_icon, &strip_wildcard(&mime));
             w.main_label.set_text(&mime);
             w.main_label.add_css_class("mime-category");
@@ -865,6 +866,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                 }));
         }
         Row::Exception { mime, handlers } => {
+            w.main_icon.set_visible(true);
             set_mime_icon(&w.main_icon, &mime);
             w.main_label.set_text(&mime);
             w.main_label.add_css_class("mime-exception");
@@ -889,7 +891,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                 w.actions
                     .append(&pick_btn("list-add-symbolic", "Set handler", wiring, {
                         let mime = mime.clone();
-                        move |desktop| undo::set_category_default(&mime, &desktop, &[])
+                        move |desktop| undo::add_exception(&mime, &desktop, &[])
                     }));
             } else {
                 w.badge.set_text("");
@@ -1764,6 +1766,18 @@ fn build_handler_card(
         card.add_css_class("new-handler-card");
     }
 
+    // Error label — created early so header-button closures can capture it.
+    let err_label = gtk4::Label::new(None);
+    err_label.add_css_class("error");
+    err_label.set_halign(gtk4::Align::Start);
+    err_label.set_wrap(true);
+    err_label.set_visible(false);
+
+    // Revealer — created early so up/down handlers can expand it to show the error.
+    let revealer = gtk4::Revealer::new();
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    revealer.set_reveal_child(is_new);
+
     // ── Header row ────────────────────────────────────────────────────────────
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     header.set_margin_top(6);
@@ -1835,12 +1849,19 @@ fn build_handler_card(
             let config = config.clone();
             let cards_box = cards_box.clone();
             let apps = apps.clone();
+            let err_label = err_label.clone();
+            let revealer = revealer.clone();
             up_btn.connect_clicked(move |_| {
                 {
                     let mut cfg = config.borrow_mut();
                     cfg.handlers.swap(i, i - 1);
                 }
-                let _ = crate::config::save(&config.borrow());
+                if let Err(e) = crate::config::save(&config.borrow()) {
+                    err_label.set_text(&format!("Save failed: {e}"));
+                    err_label.set_visible(true);
+                    revealer.set_reveal_child(true);
+                    return;
+                }
                 rebuild_handler_cards(&cards_box, &config, &apps);
             });
         }
@@ -1848,6 +1869,8 @@ fn build_handler_card(
             let config = config.clone();
             let cards_box = cards_box.clone();
             let apps = apps.clone();
+            let err_label = err_label.clone();
+            let revealer = revealer.clone();
             down_btn.connect_clicked(move |_| {
                 {
                     let mut cfg = config.borrow_mut();
@@ -1857,7 +1880,12 @@ fn build_handler_card(
                         return;
                     }
                 }
-                let _ = crate::config::save(&config.borrow());
+                if let Err(e) = crate::config::save(&config.borrow()) {
+                    err_label.set_text(&format!("Save failed: {e}"));
+                    err_label.set_visible(true);
+                    revealer.set_reveal_child(true);
+                    return;
+                }
                 rebuild_handler_cards(&cards_box, &config, &apps);
             });
         }
@@ -1871,10 +1899,7 @@ fn build_handler_card(
     let hsep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
     card.append(&hsep);
 
-    // ── Expandable body ───────────────────────────────────────────────────────
-    let revealer = gtk4::Revealer::new();
-    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    revealer.set_reveal_child(is_new);
+    // ── Expandable body (uses the revealer created above) ─────────────────────
     card.append(&revealer);
 
     {
@@ -1896,6 +1921,10 @@ fn build_handler_card(
     body.set_margin_end(12);
     revealer.set_child(Some(&body));
 
+    // Apply button created early so regex rows can update its sensitivity.
+    let apply_btn = gtk4::Button::with_label("Apply");
+    apply_btn.add_css_class("suggested-action");
+
     // Regexes section.
     let regexes_label = gtk4::Label::new(Some("Regexes"));
     regexes_label.set_halign(gtk4::Align::Start);
@@ -1906,7 +1935,7 @@ fn build_handler_card(
     body.append(&regex_box);
 
     for regex_str in &handler.regexes {
-        append_regex_row(&regex_box, regex_str);
+        append_regex_row(&regex_box, regex_str, &apply_btn);
     }
 
     let add_regex_btn = gtk4::Button::with_label("＋ Add regex");
@@ -1914,8 +1943,9 @@ fn build_handler_card(
     add_regex_btn.set_halign(gtk4::Align::Start);
     {
         let regex_box = regex_box.clone();
+        let apply_btn = apply_btn.clone();
         add_regex_btn.connect_clicked(move |_| {
-            append_regex_row(&regex_box, "");
+            append_regex_row(&regex_box, "", &apply_btn);
         });
     }
     body.append(&add_regex_btn);
@@ -1972,12 +2002,7 @@ fn build_handler_card(
     terminal_check.set_active(handler.terminal);
     body.append(&terminal_check);
 
-    // Error label (hidden until needed).
-    let err_label = gtk4::Label::new(None);
-    err_label.add_css_class("error");
-    err_label.set_halign(gtk4::Align::Start);
-    err_label.set_wrap(true);
-    err_label.set_visible(false);
+    // err_label was created early; add it to the body here.
     body.append(&err_label);
 
     // Action buttons.
@@ -2000,10 +2025,15 @@ fn build_handler_card(
             let config = config.clone();
             let cards_box = cards_box.clone();
             let apps = apps.clone();
+            let err_label = err_label.clone();
             let i = idx.unwrap();
             b.connect_clicked(move |_| {
                 config.borrow_mut().handlers.remove(i);
-                let _ = crate::config::save(&config.borrow());
+                if let Err(e) = crate::config::save(&config.borrow()) {
+                    err_label.set_text(&format!("Save failed: {e}"));
+                    err_label.set_visible(true);
+                    return;
+                }
                 rebuild_handler_cards(&cards_box, &config, &apps);
             });
         }
@@ -2015,8 +2045,6 @@ fn build_handler_card(
     spacer.set_hexpand(true);
     actions.append(&spacer);
 
-    let apply_btn = gtk4::Button::with_label("Apply");
-    apply_btn.add_css_class("suggested-action");
     {
         let config = config.clone();
         let cards_box = cards_box.clone();
@@ -2030,30 +2058,10 @@ fn build_handler_card(
 
         apply_btn.connect_clicked(move |_| {
             let regexes = collect_regexes(&regex_box);
-
-            // Check for invalid regex patterns in the entry widgets.
-            let has_invalid_regex = {
-                let mut invalid = false;
-                let mut child = regex_box.first_child();
-                while let Some(w) = child {
-                    if let Some(row) = w.downcast_ref::<gtk4::Box>()
-                        && let Some(entry) = row
-                            .first_child()
-                            .and_then(|c| c.downcast::<gtk4::Entry>().ok())
-                    {
-                        let t = entry.text();
-                        if !t.is_empty() && regex::Regex::new(t.as_str()).is_err() {
-                            invalid = true;
-                            break;
-                        }
-                    }
-                    child = w.next_sibling();
-                }
-                invalid
-            };
-
             let exec = exec_entry.text().trim().to_string();
 
+            // Validation: collect all errors before showing any.
+            let has_invalid_regex = any_invalid_regex(&regex_box);
             let mut errors: Vec<&str> = Vec::new();
             if regexes.is_empty() {
                 errors.push("At least one regex is required.");
@@ -2078,7 +2086,11 @@ fn build_handler_card(
 
             if let Some(i) = idx {
                 config.borrow_mut().handlers[i] = new_handler;
-                let _ = crate::config::save(&config.borrow());
+                if let Err(e) = crate::config::save(&config.borrow()) {
+                    err_label.set_text(&format!("Save failed: {e}"));
+                    err_label.set_visible(true);
+                    return;
+                }
                 let cfg = config.borrow();
                 let h = &cfg.handlers[i];
                 let display_name = if h.exec.is_empty() {
@@ -2096,7 +2108,11 @@ fn build_handler_card(
                 toggle_btn.set_active(false);
             } else {
                 config.borrow_mut().handlers.push(new_handler);
-                let _ = crate::config::save(&config.borrow());
+                if let Err(e) = crate::config::save(&config.borrow()) {
+                    err_label.set_text(&format!("Save failed: {e}"));
+                    err_label.set_visible(true);
+                    return;
+                }
                 rebuild_handler_cards(&cards_box, &config, &apps);
             }
 
@@ -2109,7 +2125,29 @@ fn build_handler_card(
     card
 }
 
-fn append_regex_row(regex_box: &gtk4::Box, initial: &str) {
+fn any_invalid_regex(regex_box: &gtk4::Box) -> bool {
+    let mut child = regex_box.first_child();
+    while let Some(w) = child {
+        if let Some(row) = w.downcast_ref::<gtk4::Box>()
+            && let Some(entry) = row
+                .first_child()
+                .and_then(|c| c.downcast::<gtk4::Entry>().ok())
+        {
+            let t = entry.text();
+            if !t.is_empty() && regex::Regex::new(t.as_str()).is_err() {
+                return true;
+            }
+        }
+        child = w.next_sibling();
+    }
+    false
+}
+
+fn update_apply_sensitivity(apply_btn: &gtk4::Button, regex_box: &gtk4::Box) {
+    apply_btn.set_sensitive(!any_invalid_regex(regex_box));
+}
+
+fn append_regex_row(regex_box: &gtk4::Box, initial: &str, apply_btn: &gtk4::Button) {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
 
     let entry = gtk4::Entry::new();
@@ -2117,14 +2155,19 @@ fn append_regex_row(regex_box: &gtk4::Box, initial: &str) {
     entry.set_hexpand(true);
     entry.set_placeholder_text(Some("regex pattern"));
 
-    entry.connect_changed(|e| {
-        let text = e.text();
-        if text.is_empty() || regex::Regex::new(text.as_str()).is_ok() {
-            e.remove_css_class("error");
-        } else {
-            e.add_css_class("error");
-        }
-    });
+    {
+        let apply_btn = apply_btn.clone();
+        let regex_box = regex_box.clone();
+        entry.connect_changed(move |e| {
+            let text = e.text();
+            if text.is_empty() || regex::Regex::new(text.as_str()).is_ok() {
+                e.remove_css_class("error");
+            } else {
+                e.add_css_class("error");
+            }
+            update_apply_sensitivity(&apply_btn, &regex_box);
+        });
+    }
 
     let rm_btn = gtk4::Button::from_icon_name("edit-delete-symbolic");
     rm_btn.add_css_class("flat");
@@ -2132,8 +2175,10 @@ fn append_regex_row(regex_box: &gtk4::Box, initial: &str) {
     {
         let row = row.clone();
         let regex_box = regex_box.clone();
+        let apply_btn = apply_btn.clone();
         rm_btn.connect_clicked(move |_| {
             regex_box.remove(&row);
+            update_apply_sensitivity(&apply_btn, &regex_box);
         });
     }
 
@@ -2298,24 +2343,40 @@ fn resolve_input(
         handlr::detect_mime_str(input).ok()
     };
 
-    // 3. Look up MIME in defaults.
-    if let Some(ref m) = mime
-        && let Some((_, handlers)) = state.defaults.iter().find(|(dm, _)| dm == m)
-        && let Some(desktop) = handlers.first()
-    {
-        let display_name = apps
+    // 3. Look up MIME in defaults (exact match, then wildcard prefix fallback).
+    if let Some(ref m) = mime {
+        let found = state
+            .defaults
             .iter()
-            .find(|a| &a.desktop == desktop)
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| desktop.clone());
-        let icon = gio::DesktopAppInfo::new(desktop).and_then(|i| i.icon());
-        return Resolution {
-            kind: ResolutionKind::MimeDefault { mime: m.clone() },
-            display_name,
-            icon,
-            regex_attempts,
-            detected_mime: mime,
-        };
+            .find(|(dm, h)| dm == m && !h.is_empty())
+            .or_else(|| {
+                state
+                    .defaults
+                    .iter()
+                    .filter(|(dm, h)| {
+                        !h.is_empty()
+                            && dm.ends_with('*')
+                            && m.starts_with(dm.strip_suffix('*').unwrap_or(dm))
+                    })
+                    .max_by_key(|(dm, _)| dm.len())
+            });
+        if let Some((_, handlers)) = found
+            && let Some(desktop) = handlers.first()
+        {
+            let display_name = apps
+                .iter()
+                .find(|a| &a.desktop == desktop)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| desktop.clone());
+            let icon = gio::DesktopAppInfo::new(desktop).and_then(|i| i.icon());
+            return Resolution {
+                kind: ResolutionKind::MimeDefault { mime: m.clone() },
+                display_name,
+                icon,
+                regex_attempts,
+                detected_mime: mime,
+            };
+        }
     }
 
     Resolution {
@@ -2455,9 +2516,6 @@ fn build_resolution_display(results_box: &gtk4::Box, resolution: &Resolution) {
             desc.set_hexpand(true);
             desc.set_xalign(0.0);
             desc.add_css_class("dim-label");
-            if !attempt.matched && !attempt.skipped {
-                // keep normal dim
-            }
             row.append(&desc);
 
             if !attempt.skipped {

@@ -23,6 +23,12 @@ fn main() -> glib::ExitCode {
 }
 
 fn on_activate(app: &gtk4::Application) {
+    // Present existing window if the app is already running.
+    if let Some(w) = app.windows().first() {
+        w.present();
+        return;
+    }
+
     // 1. handlr on PATH?
     if let Err(e) = handlr::check_present() {
         show_startup_error(
@@ -58,17 +64,19 @@ fn on_activate(app: &gtk4::Application) {
         let state = state.clone();
         move |path| match handlr::detect_mime(&path) {
             Ok(mime) => {
-                let has_exact =
-                    state.borrow().state().defaults.iter().any(|(m, _)| m == &mime);
-                if !has_exact {
+                // Try scrolling to an existing row first (exact or wildcard match).
+                // If not found, inject a pending exception and retry so the user can
+                // see the MIME in context and click "Set handler". If still not found
+                // (no category at all), show the banner.
+                if !ui::scroll_to_mime(&tree, &mime) {
                     state.borrow_mut().add_pending_exception(mime.clone());
                     ui::rebuild_tree(&tree, &state);
-                }
-                if !ui::scroll_to_mime(&tree, &mime) {
-                    ui::show_banner(
-                        &tree,
-                        &format!("MIME {mime} has no matching category."),
-                    );
+                    if !ui::scroll_to_mime(&tree, &mime) {
+                        ui::show_banner(
+                            &tree,
+                            &format!("MIME {mime} has no matching category."),
+                        );
+                    }
                 }
             }
             Err(e) => ui::show_banner(&tree, &format!("MIME detect failed: {e}")),

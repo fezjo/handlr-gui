@@ -28,10 +28,6 @@ pub(crate) fn set_category_default(mime: &str, new: &str, prior: &[String]) -> U
     UndoEntry { label, forward, inverse }
 }
 
-// Currently no UI path invokes this directly (Category-row "Change" goes via
-// set_category_default + picker). Kept for the v1 Delete-key shortcut (spec §6) and
-// future header-bar "clear default" affordances.
-#[allow(dead_code)]
 pub(crate) fn clear_category_default(mime: &str, prior: &[String]) -> UndoEntry {
     // If alternatives exist, remove only the default so the next one is promoted.
     // If there are no alternatives, unset the entry entirely.
