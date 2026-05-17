@@ -44,10 +44,13 @@ fn on_activate(app: &gtk4::Application) {
     };
     let state = Rc::new(RefCell::new(state));
 
-    // 3. Build window.
-    let (window, tree) = ui::build_window(app, state.clone());
+    // 3. Load config (non-fatal: use defaults if loading fails).
+    let config = Rc::new(RefCell::new(config::load().unwrap_or_default()));
 
-    // 4. Install drop target. On drop: resolve mime, then:
+    // 4. Build window.
+    let (window, tree) = ui::build_window(app, state.clone(), config);
+
+    // 5. Install drop target. On drop: resolve mime, then:
     //    - If an exact entry (exception or category) already exists → scroll to it.
     //    - Otherwise → inject a pending empty exception so the user can see the MIME in
     //      context and optionally click "Set handler" to configure it.

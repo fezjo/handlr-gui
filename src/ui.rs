@@ -103,16 +103,26 @@ pub(crate) struct TreeHandle {
     pub(crate) info_label: gtk4::Label,
 }
 
+// Repopulate the root store from the current AppState. Call after mutating
+// AppState without going through apply/undo/redo (e.g. add_pending_exception).
+pub(crate) fn rebuild_tree(handle: &TreeHandle, state: &std::rc::Rc<std::cell::RefCell<AppState>>) {
+    populate_root(&handle.root_store, state);
+}
+
 pub(crate) fn build_window(
     app: &gtk4::Application,
     state: Rc<RefCell<AppState>>,
+    config: Rc<RefCell<crate::config::Config>>,
 ) -> (gtk4::ApplicationWindow, TreeHandle) {
+    let _ = config;
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title("handlr-gui")
         .default_width(720)
         .default_height(600)
         .build();
+
+    init_row_css(&window);
 
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     window.set_child(Some(&vbox));
@@ -284,51 +294,50 @@ pub(crate) fn build_window(
 
 // Find the row whose mime matches `mime`, scroll the list view to it, and return true.
 // Returns false when no row matches — caller decides how to surface that (e.g. banner).
-// v1 limitation: for exception mimes (e.g. "video/mp4"), we scroll to the parent
-// Category ("video/*") rather than expanding it and scrolling to the exception row.
-// Expanding requires walking the TreeListModel post-render, which is non-trivial.
 pub(crate) fn scroll_to_mime(handle: &TreeHandle, mime: &str) -> bool {
     let Some(idx) = locate_mime(handle, mime) else {
         return false;
     };
-    handle
-        .list_view
-        .scroll_to(idx, gtk4::ListScrollFlags::FOCUS, None);
+    // SELECT highlights the row so the jump is visible even when the row was already
+    // on-screen; FOCUS lets keyboard navigation continue from there.
+    handle.list_view.scroll_to(
+        idx,
+        gtk4::ListScrollFlags::FOCUS | gtk4::ListScrollFlags::SELECT,
+        None,
+    );
     true
 }
 
-// Walks the root store and returns the index of the best matching Category row, or None.
-// Prefers an exact Category mime match; falls back to the longest wildcard-prefix match.
+// Walk the flattened TreeListModel that backs the ListView (NOT the root_store —
+// its indices are the unexpanded root positions and don't match the visible list).
+// Prefer an exact Category/Exception mime match, falling back to the longest wildcard
+// prefix on a Category row.
 fn locate_mime(handle: &TreeHandle, mime: &str) -> Option<u32> {
-    let store = &handle.root_store;
-    let n = store.n_items();
+    let model = handle.list_view.model()?;
+    let n = model.n_items();
+    let mut best: Option<(usize, u32)> = None; // (prefix_len, flat index)
 
-    // Pass 1: exact match against any Category mime.
     for i in 0..n {
-        let Some(obj) = store.item(i) else { continue };
-        let Some(row_obj) = obj.downcast_ref::<RowObject>() else {
+        let Some(item) = model.item(i) else { continue };
+        let Some(tree_row) = item.downcast_ref::<gtk4::TreeListRow>() else {
             continue;
         };
-        if let Row::Category { mime: m, .. } = row_obj.row()
-            && m == mime
-        {
-            return Some(i);
-        }
-    }
-
-    // Pass 2: longest wildcard prefix match — scroll to parent category.
-    let mut best: Option<(usize, u32)> = None; // (prefix_len, index)
-    for i in 0..n {
-        let Some(obj) = store.item(i) else { continue };
-        let Some(row_obj) = obj.downcast_ref::<RowObject>() else {
+        let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok())
+        else {
             continue;
         };
-        if let Row::Category { mime: cat, .. } = row_obj.row()
-            && let Some(prefix) = cat.strip_suffix('*')
-            && mime.starts_with(prefix)
-            && prefix.len() > best.map(|b| b.0).unwrap_or(0)
-        {
-            best = Some((prefix.len(), i));
+        match row_obj.row() {
+            Row::Category { mime: cat, .. } if cat == mime => return Some(i),
+            Row::Exception { mime: exc, .. } if exc == mime => return Some(i),
+            Row::Category { mime: cat, .. } => {
+                if let Some(prefix) = cat.strip_suffix('*')
+                    && mime.starts_with(prefix)
+                    && prefix.len() > best.map(|b| b.0).unwrap_or(0)
+                {
+                    best = Some((prefix.len(), i));
+                }
+            }
+            _ => {}
         }
     }
     best.map(|(_, idx)| idx)
@@ -642,10 +651,15 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
     };
     clear_actions(&w.actions);
 
+    // Reset colour classes from any previous bind before applying the right one.
+    w.main_label.remove_css_class("mime-category");
+    w.main_label.remove_css_class("mime-exception");
+
     match row_obj.row() {
         Row::Category { mime, handlers } => {
             set_mime_icon(&w.main_icon, &strip_wildcard(&mime));
             w.main_label.set_text(&mime);
+            w.main_label.add_css_class("mime-category");
             set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
             w.badge.set_text("");
 
@@ -680,25 +694,35 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
         Row::Exception { mime, handlers } => {
             set_mime_icon(&w.main_icon, &mime);
             w.main_label.set_text(&mime);
+            w.main_label.add_css_class("mime-exception");
             set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
-            w.badge.set_text("(exception)");
 
-            w.actions.append(&pick_btn(
-                "document-edit-symbolic",
-                "Change default",
-                wiring,
-                {
+            if handlers.is_empty() {
+                // Pending (not yet configured in handlr). No handler to remove; offer Set.
+                w.badge.set_text("(exception)");
+                w.actions.append(&pick_btn("list-add-symbolic", "Set handler", wiring, {
                     let mime = mime.clone();
-                    let handlers = handlers.clone();
-                    move |desktop| undo::set_category_default(&mime, &desktop, &handlers)
-                },
-            ));
-            w.actions.append(&simple_btn(
-                "user-trash-symbolic",
-                "Remove exception",
-                wiring,
-                move || undo::remove_exception(&mime, &handlers),
-            ));
+                    move |desktop| undo::set_category_default(&mime, &desktop, &[])
+                }));
+            } else {
+                w.badge.set_text("(exception)");
+                w.actions.append(&pick_btn(
+                    "document-edit-symbolic",
+                    "Change default",
+                    wiring,
+                    {
+                        let mime = mime.clone();
+                        let handlers = handlers.clone();
+                        move |desktop| undo::set_category_default(&mime, &desktop, &handlers)
+                    },
+                ));
+                w.actions.append(&simple_btn(
+                    "user-trash-symbolic",
+                    "Remove exception",
+                    wiring,
+                    move || undo::remove_exception(&mime, &handlers),
+                ));
+            }
         }
         Row::Handler { mime, desktop, index, .. } => {
             let info = gio::DesktopAppInfo::new(&desktop);
@@ -795,6 +819,23 @@ fn system_apps(wiring: &Wiring) -> Vec<handlr::App> {
             name: a.name.clone(),
         })
         .collect()
+}
+
+// Load CSS that colours MIME labels by row variant using named theme colours.
+// @accent_color and @success_color are defined by Adwaita and most GTK4 themes,
+// so the palette adapts when the user switches themes.
+fn init_row_css(window: &gtk4::ApplicationWindow) {
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(
+        ".mime-category { color: @accent_color; }\
+         .mime-exception { color: @success_color; }",
+    );
+    #[allow(deprecated)]
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(window),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
 
 fn set_mime_icon(image: &gtk4::Image, mime: &str) {
