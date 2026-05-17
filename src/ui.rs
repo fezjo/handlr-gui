@@ -1470,6 +1470,17 @@ pub(crate) fn build_regex_handlers_tab(
         });
     }
 
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(
+        ".new-handler-card { border: 1px dashed alpha(currentColor, 0.3); border-radius: 12px; }",
+    );
+    #[allow(deprecated)]
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().expect("display"),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
     outer.upcast()
 }
 
@@ -1506,6 +1517,9 @@ fn build_handler_card(
 
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     card.add_css_class("card");
+    if is_new {
+        card.add_css_class("new-handler-card");
+    }
 
     // ── Header row ────────────────────────────────────────────────────────────
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -1749,6 +1763,29 @@ fn build_handler_card(
 
         apply_btn.connect_clicked(move |_| {
             let regexes = collect_regexes(&regex_box);
+
+            // Check for invalid regex patterns in the entry widgets.
+            let has_invalid_regex = {
+                let mut invalid = false;
+                let mut child = regex_box.first_child();
+                while let Some(w) = child {
+                    if let Some(row) = w.downcast_ref::<gtk4::Box>() {
+                        if let Some(entry) = row
+                            .first_child()
+                            .and_then(|c| c.downcast::<gtk4::Entry>().ok())
+                        {
+                            let t = entry.text();
+                            if !t.is_empty() && regex::Regex::new(t.as_str()).is_err() {
+                                invalid = true;
+                                break;
+                            }
+                        }
+                    }
+                    child = w.next_sibling();
+                }
+                invalid
+            };
+
             let exec = exec_entry.text().trim().to_string();
 
             let mut errors: Vec<&str> = Vec::new();
@@ -1757,6 +1794,9 @@ fn build_handler_card(
             }
             if exec.is_empty() {
                 errors.push("Command must not be empty.");
+            }
+            if has_invalid_regex {
+                errors.push("One or more regexes are invalid.");
             }
             if !errors.is_empty() {
                 err_label.set_text(&errors.join(" "));
