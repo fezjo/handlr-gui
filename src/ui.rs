@@ -1203,6 +1203,8 @@ fn build_settings_dialog(
         .default_width(420)
         .build();
 
+    dlg.set_titlebar(Some(&gtk4::HeaderBar::new()));
+
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     outer.set_margin_top(16);
     outer.set_margin_bottom(16);
