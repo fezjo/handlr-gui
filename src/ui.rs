@@ -1566,11 +1566,15 @@ fn build_handler_card(
         summary_label.set_text("New handler");
         summary_label.add_css_class("dim-label");
     } else {
-        let exec_short = handler.exec.split_whitespace().next().unwrap_or("(no command)");
+        let display_name = if handler.exec.is_empty() {
+            "(no command)".to_string()
+        } else {
+            resolve_exec_name(&handler.exec, &apps)
+        };
         let count = handler.regexes.len();
         summary_label.set_text(&format!(
             "{} — {} regex{}",
-            exec_short,
+            display_name,
             count,
             if count == 1 { "" } else { "es" }
         ));
@@ -1843,11 +1847,15 @@ fn build_handler_card(
                 let _ = crate::config::save(&config.borrow());
                 let cfg = config.borrow();
                 let h = &cfg.handlers[i];
-                let exec_short = h.exec.split_whitespace().next().unwrap_or("(no command)");
+                let display_name = if h.exec.is_empty() {
+                    "(no command)".to_string()
+                } else {
+                    resolve_exec_name(&h.exec, &apps)
+                };
                 let count = h.regexes.len();
                 summary_label.set_text(&format!(
                     "{} — {} regex{}",
-                    exec_short,
+                    display_name,
                     count,
                     if count == 1 { "" } else { "es" }
                 ));
@@ -1898,6 +1906,36 @@ fn append_regex_row(regex_box: &gtk4::Box, initial: &str) {
     row.append(&entry);
     row.append(&rm_btn);
     regex_box.append(&row);
+}
+
+// Try to resolve a human-readable app name from an exec string by matching
+// the executable basename against the commandline of known DesktopAppInfo entries.
+fn resolve_exec_name(exec: &str, apps: &[handlr::App]) -> String {
+    let exec_basename = exec
+        .split_whitespace()
+        .next()
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| exec.to_string());
+
+    for app in apps {
+        if let Some(info) = gio::DesktopAppInfo::new(&app.desktop)
+            && let Some(cmdline) = info.commandline()
+        {
+            let basename = cmdline
+                .to_string_lossy()
+                .split_whitespace()
+                .next()
+                .and_then(|s| std::path::Path::new(s).file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if basename == exec_basename {
+                return app.name.clone();
+            }
+        }
+    }
+
+    exec_basename
 }
 
 fn collect_regexes(regex_box: &gtk4::Box) -> Vec<String> {
