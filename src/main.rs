@@ -1,6 +1,7 @@
 //! App entry: handlr presence check, state load, window build, drop-target wiring.
 //! Startup failures surface as a modal GtkAlertDialog and quit on dismiss (spec §5).
 
+mod config;
 mod dnd;
 mod handlr;
 mod model;
@@ -44,20 +45,31 @@ fn on_activate(app: &gtk4::Application) {
     let state = Rc::new(RefCell::new(state));
 
     // 3. Build window.
-    let (window, tree) = ui::build_window(app, state);
+    let (window, tree) = ui::build_window(app, state.clone());
 
-    // 4. Install drop target. On drop: resolve mime, scroll to row. Errors and "not in
-    //    any category" both surface in the info bar (spec §7 step 4).
-    dnd::install(&window, move |path| match handlr::detect_mime(&path) {
-        Ok(mime) => {
-            if !ui::scroll_to_mime(&tree, &mime) {
-                ui::show_banner(
-                    &tree,
-                    &format!("MIME {mime} not found in any configured category."),
-                );
+    // 4. Install drop target. On drop: resolve mime, then:
+    //    - If an exact entry (exception or category) already exists → scroll to it.
+    //    - Otherwise → inject a pending empty exception so the user can see the MIME in
+    //      context and optionally click "Set handler" to configure it.
+    dnd::install(&window, {
+        let state = state.clone();
+        move |path| match handlr::detect_mime(&path) {
+            Ok(mime) => {
+                let has_exact =
+                    state.borrow().state().defaults.iter().any(|(m, _)| m == &mime);
+                if !has_exact {
+                    state.borrow_mut().add_pending_exception(mime.clone());
+                    ui::rebuild_tree(&tree, &state);
+                }
+                if !ui::scroll_to_mime(&tree, &mime) {
+                    ui::show_banner(
+                        &tree,
+                        &format!("MIME {mime} has no matching category."),
+                    );
+                }
             }
+            Err(e) => ui::show_banner(&tree, &format!("MIME detect failed: {e}")),
         }
-        Err(e) => ui::show_banner(&tree, &format!("MIME detect failed: {e}")),
     });
 
     window.present();
