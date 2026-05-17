@@ -744,13 +744,13 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
 
             if handlers.is_empty() {
                 // Pending (not yet configured in handlr). No handler to remove; offer Set.
-                w.badge.set_text("(exception)");
+                w.badge.set_text("");
                 w.actions.append(&pick_btn("list-add-symbolic", "Set handler", wiring, {
                     let mime = mime.clone();
                     move |desktop| undo::set_category_default(&mime, &desktop, &[])
                 }));
             } else {
-                w.badge.set_text("(exception)");
+                w.badge.set_text("");
                 w.actions.append(&pick_btn(
                     "document-edit-symbolic",
                     "Change default",
@@ -1203,12 +1203,6 @@ fn build_settings_dialog(
         .default_width(420)
         .build();
 
-    let dlg_header = gtk4::HeaderBar::new();
-    let close_btn = gtk4::Button::with_label("Close");
-    close_btn.add_css_class("suggested-action");
-    dlg_header.pack_end(&close_btn);
-    dlg.set_titlebar(Some(&dlg_header));
-
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     outer.set_margin_top(16);
     outer.set_margin_bottom(16);
@@ -1329,11 +1323,6 @@ fn build_settings_dialog(
             config.borrow_mut().expand_wildcards = sw.is_active();
             apply_config_save(&config, &err_label);
         });
-    }
-
-    {
-        let dlg = dlg.clone();
-        close_btn.connect_clicked(move |_| dlg.close());
     }
 
     let key_ctrl = gtk4::EventControllerKey::new();
