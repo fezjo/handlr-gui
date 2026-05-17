@@ -33,12 +33,17 @@ pub(crate) fn set_category_default(mime: &str, new: &str, prior: &[String]) -> U
 // future header-bar "clear default" affordances.
 #[allow(dead_code)]
 pub(crate) fn clear_category_default(mime: &str, prior: &[String]) -> UndoEntry {
-    let forward = vec![HandlrCmd::Unset { mime: mime.into() }];
-    let inverse = inverse_for_set(mime, prior);
+    // If alternatives exist, remove only the default so the next one is promoted.
+    // If there are no alternatives, unset the entry entirely.
+    let forward = if prior.len() > 1 {
+        vec![HandlrCmd::Remove { mime: mime.into(), desktop: prior[0].clone() }]
+    } else {
+        vec![HandlrCmd::Unset { mime: mime.into() }]
+    };
     UndoEntry {
-        label: format!("clear {}", mime),
+        label: format!("clear {} default", mime),
         forward,
-        inverse,
+        inverse: inverse_for_set(mime, prior),
     }
 }
 
@@ -87,6 +92,34 @@ pub(crate) fn remove_handler(mime: &str, desktop: &str) -> UndoEntry {
             desktop: desktop.into(),
         }],
     }
+}
+
+/// Swap the handler at `index` with the one above it (`index - 1`). Returns `None` if
+/// `index` is 0 or out of range. Both forward and inverse are full reorders so they're
+/// always consistent regardless of what other operations run in between.
+pub(crate) fn move_handler_up(mime: &str, handlers: &[String], index: usize) -> Option<UndoEntry> {
+    if index == 0 || index >= handlers.len() {
+        return None;
+    }
+    let mut new_order = handlers.to_vec();
+    new_order.swap(index - 1, index);
+    Some(UndoEntry {
+        label: format!("promote {} in {}", handlers[index], mime),
+        forward: order_cmds(mime, &new_order),
+        inverse: order_cmds(mime, handlers),
+    })
+}
+
+fn order_cmds(mime: &str, handlers: &[String]) -> Vec<HandlrCmd> {
+    if handlers.is_empty() {
+        return vec![HandlrCmd::Unset { mime: mime.into() }];
+    }
+    let mut cmds = Vec::with_capacity(handlers.len());
+    cmds.push(HandlrCmd::Set { mime: mime.into(), desktop: handlers[0].clone() });
+    for d in &handlers[1..] {
+        cmds.push(HandlrCmd::Add { mime: mime.into(), desktop: d.clone() });
+    }
+    cmds
 }
 
 pub(crate) fn push_bounded(stack: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
@@ -176,13 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn clear_with_multiple_handlers_chains_inverse() {
+    fn clear_with_multiple_handlers_promotes_alternative() {
         let prior = vec!["mpv.desktop".to_string(), "vlc.desktop".to_string()];
         let e = clear_category_default("video/*", &prior);
+        // Forward removes only the default so vlc is promoted, not a full unset.
         assert_eq!(
             e.forward,
-            vec![HandlrCmd::Unset {
-                mime: "video/*".into()
+            vec![HandlrCmd::Remove {
+                mime: "video/*".into(),
+                desktop: "mpv.desktop".into()
             }]
         );
         assert_eq!(

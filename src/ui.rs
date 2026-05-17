@@ -55,7 +55,11 @@ impl RowObject {
     }
 
     fn row(&self) -> Row {
-        self.imp().row.borrow().clone().expect("RowObject row not set")
+        self.imp()
+            .row
+            .borrow()
+            .clone()
+            .expect("RowObject row not set")
     }
 }
 
@@ -71,11 +75,23 @@ impl AppObject {
     }
 
     fn desktop(&self) -> String {
-        self.imp().app.borrow().as_ref().expect("app not set").desktop.clone()
+        self.imp()
+            .app
+            .borrow()
+            .as_ref()
+            .expect("app not set")
+            .desktop
+            .clone()
     }
 
     fn name(&self) -> String {
-        self.imp().app.borrow().as_ref().expect("app not set").name.clone()
+        self.imp()
+            .app
+            .borrow()
+            .as_ref()
+            .expect("app not set")
+            .name
+            .clone()
     }
 }
 
@@ -286,11 +302,19 @@ pub(crate) fn build_window(
     });
     add_action(&window, "undo", {
         let b = undo_btn.clone();
-        move || if b.is_sensitive() { b.emit_clicked() }
+        move || {
+            if b.is_sensitive() {
+                b.emit_clicked()
+            }
+        }
     });
     add_action(&window, "redo", {
         let b = redo_btn.clone();
-        move || if b.is_sensitive() { b.emit_clicked() }
+        move || {
+            if b.is_sensitive() {
+                b.emit_clicked()
+            }
+        }
     });
 
     install_shortcuts(&window);
@@ -319,20 +343,84 @@ pub(crate) fn build_window(
         });
     }
 
-    // Delete on the focused tree row: clear/remove per §6.
+    // Left/Right expand/collapse the focused tree row. Capture phase so we intercept
+    // before GTK's focus-traversal moves focus to the row's buttons.
+    {
+        let list_view_for_arrows = list_view.clone();
+        let arrow_ctrl = gtk4::EventControllerKey::new();
+        arrow_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        arrow_ctrl.connect_key_pressed(move |_, key, _, _| {
+            let expand = match key {
+                gdk::Key::Right => true,
+                gdk::Key::Left => false,
+                _ => return glib::Propagation::Proceed,
+            };
+            let Some(selection) = list_view_for_arrows
+                .model()
+                .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())
+            else {
+                return glib::Propagation::Proceed;
+            };
+            let pos = selection.selected();
+            let Some(tree_row) = selection
+                .item(pos)
+                .and_then(|o| o.downcast::<gtk4::TreeListRow>().ok())
+            else {
+                return glib::Propagation::Proceed;
+            };
+            if !tree_row.is_expandable() {
+                return glib::Propagation::Proceed;
+            }
+            tree_row.set_expanded(expand);
+            glib::Propagation::Stop
+        });
+        list_view.add_controller(arrow_ctrl);
+    }
+
+    // Row-level keyboard shortcuts in the Defaults tab.
     {
         let wiring = wiring.clone();
         let list_view_for_key = list_view.clone();
         let key_ctrl = gtk4::EventControllerKey::new();
-        key_ctrl.connect_key_pressed(move |_, key, _, _| {
-            if key != gdk::Key::Delete {
-                return glib::Propagation::Proceed;
+        key_ctrl.connect_key_pressed(move |_, key, _, _| match key {
+            gdk::Key::Delete => {
+                let Some(entry) = delete_target(&list_view_for_key) else {
+                    return glib::Propagation::Proceed;
+                };
+                apply_entry(&wiring, entry);
+                glib::Propagation::Stop
             }
-            let Some(entry) = delete_target(&list_view_for_key) else {
-                return glib::Propagation::Proceed;
-            };
-            apply_entry(&wiring, entry);
-            glib::Propagation::Stop
+            gdk::Key::Insert => {
+                let Some(row) = focused_row_data(&list_view_for_key) else {
+                    return glib::Propagation::Proceed;
+                };
+                let apps = system_apps(&wiring);
+                let wiring_inner = wiring.clone();
+                let anchor = list_view_for_key.upcast_ref::<gtk4::Widget>();
+                match row {
+                    Row::Category { mime, handlers } => {
+                        let handlers_empty = handlers.is_empty();
+                        show_app_picker(anchor, &apps, move |desktop| {
+                            let entry = if handlers_empty {
+                                undo::set_category_default(&mime, &desktop, &[])
+                            } else {
+                                undo::add_handler(&mime, &desktop)
+                            };
+                            apply_entry(&wiring_inner, entry);
+                        });
+                        glib::Propagation::Stop
+                    }
+                    Row::Exception { mime, handlers } => {
+                        show_app_picker(anchor, &apps, move |desktop| {
+                            let entry = undo::set_category_default(&mime, &desktop, &handlers);
+                            apply_entry(&wiring_inner, entry);
+                        });
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            }
+            _ => glib::Propagation::Proceed,
         });
         list_view.add_controller(key_ctrl);
     }
@@ -376,8 +464,7 @@ fn locate_mime(handle: &TreeHandle, mime: &str) -> Option<u32> {
         let Some(tree_row) = item.downcast_ref::<gtk4::TreeListRow>() else {
             continue;
         };
-        let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok())
-        else {
+        let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else {
             continue;
         };
         match row_obj.row() {
@@ -410,8 +497,7 @@ fn add_action(window: &gtk4::ApplicationWindow, name: &str, callback: impl Fn() 
     window.add_action(&action);
 }
 
-// Global keyboard shortcuts (§6). Row-level keys (Enter/Delete/Insert) are deferred —
-// the button affordances cover the operations in v1.
+// Global keyboard shortcuts (§6).
 fn install_shortcuts(window: &gtk4::ApplicationWindow) {
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Global);
@@ -484,11 +570,7 @@ fn refresh_view(wiring: &Wiring) {
     refresh_header(&wiring.state, &wiring.undo_btn, &wiring.redo_btn);
 }
 
-fn refresh_header(
-    state: &Rc<RefCell<AppState>>,
-    undo_btn: &gtk4::Button,
-    redo_btn: &gtk4::Button,
-) {
+fn refresh_header(state: &Rc<RefCell<AppState>>, undo_btn: &gtk4::Button, redo_btn: &gtk4::Button) {
     let s = state.borrow();
     undo_btn.set_sensitive(s.can_undo());
     undo_btn.set_tooltip_text(Some(
@@ -518,6 +600,18 @@ fn populate_root(root_store: &gio::ListStore, state: &Rc<RefCell<AppState>>) {
     }
 }
 
+fn focused_row_data(list_view: &gtk4::ListView) -> Option<Row> {
+    let selection = list_view
+        .model()
+        .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())?;
+    let pos = selection.selected();
+    let tree_row = selection.item(pos)?.downcast::<gtk4::TreeListRow>().ok()?;
+    let row_obj = tree_row
+        .item()
+        .and_then(|o| o.downcast::<RowObject>().ok())?;
+    Some(row_obj.row())
+}
+
 // Derive the UndoEntry for "delete the focused row". None when there's nothing to
 // delete (e.g. empty Category, or the default Handler row whose removal must go through
 // "change default" instead).
@@ -527,15 +621,20 @@ fn delete_target(list_view: &gtk4::ListView) -> Option<UndoEntry> {
         .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())?;
     let pos = selection.selected();
     let tree_row = selection.item(pos)?.downcast::<gtk4::TreeListRow>().ok()?;
-    let row_obj = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok())?;
+    let row_obj = tree_row
+        .item()
+        .and_then(|o| o.downcast::<RowObject>().ok())?;
     match row_obj.row() {
         Row::Category { mime, handlers } if !handlers.is_empty() => {
             Some(undo::clear_category_default(&mime, &handlers))
         }
         Row::Exception { mime, handlers } => Some(undo::remove_exception(&mime, &handlers)),
-        Row::Handler { mime, desktop, index, .. } if index > 0 => {
-            Some(undo::remove_handler(&mime, &desktop))
-        }
+        Row::Handler {
+            mime,
+            desktop,
+            index,
+            ..
+        } if index > 0 => Some(undo::remove_handler(&mime, &desktop)),
         _ => None,
     }
 }
@@ -547,12 +646,10 @@ fn build_list_view(
     state: Rc<RefCell<AppState>>,
 ) -> (gtk4::ListView, gtk4::SignalListItemFactory) {
     // passthrough=false, autoexpand=true: model items are RowObject directly, and categories auto-expand on first show.
-    let tree_model = gtk4::TreeListModel::new(
-        root_store,
-        false,
-        true,
-        move |parent_obj: &glib::Object| create_children(parent_obj, &state),
-    );
+    let tree_model =
+        gtk4::TreeListModel::new(root_store, false, true, move |parent_obj: &glib::Object| {
+            create_children(parent_obj, &state)
+        });
 
     let selection = gtk4::SingleSelection::new(Some(tree_model));
 
@@ -572,6 +669,7 @@ fn create_children(
     match row {
         Row::Category { mime, handlers } => {
             let store = gio::ListStore::new::<RowObject>();
+            // Alternative handlers first (right below parent), then exceptions, then add button.
             // Skip handlers[0] — shown inline on the category row itself.
             for child in model::handlers_for(&mime, &handlers).into_iter().skip(1) {
                 store.append(&RowObject::new(child));
@@ -579,11 +677,8 @@ fn create_children(
             for child in model::exceptions_for(&mime, state.borrow().state()) {
                 store.append(&RowObject::new(child));
             }
-            if store.n_items() == 0 {
-                None
-            } else {
-                Some(store.upcast())
-            }
+            store.append(&RowObject::new(Row::AddException { category_mime: mime }));
+            Some(store.upcast())
         }
         Row::Exception { mime, handlers } => {
             let store = gio::ListStore::new::<RowObject>();
@@ -597,7 +692,7 @@ fn create_children(
                 Some(store.upcast())
             }
         }
-        Row::Handler { .. } => None,
+        Row::Handler { .. } | Row::AddException { .. } => None,
     }
 }
 
@@ -656,13 +751,21 @@ struct RowWidgets {
 }
 
 fn unpack_row_widgets(expander: &gtk4::TreeExpander) -> Option<RowWidgets> {
-    let row_box = expander.child().and_then(|c| c.downcast::<gtk4::Box>().ok())?;
+    let row_box = expander
+        .child()
+        .and_then(|c| c.downcast::<gtk4::Box>().ok())?;
     let main_icon = row_box.first_child()?.downcast::<gtk4::Image>().ok()?;
     let main_label = main_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
     let spacer = main_label.next_sibling()?.downcast::<gtk4::Box>().ok()?;
     let handler_icon = spacer.next_sibling()?.downcast::<gtk4::Image>().ok()?;
-    let handler_label = handler_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
-    let badge = handler_label.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+    let handler_label = handler_icon
+        .next_sibling()?
+        .downcast::<gtk4::Label>()
+        .ok()?;
+    let badge = handler_label
+        .next_sibling()?
+        .downcast::<gtk4::Label>()
+        .ok()?;
     let actions = badge.next_sibling()?.downcast::<gtk4::Box>().ok()?;
     Some(RowWidgets {
         main_icon,
@@ -689,13 +792,18 @@ fn make_action_btn(icon: &str, tooltip: &str) -> gtk4::Button {
 
 fn bind_row(item: &glib::Object, wiring: &Wiring) {
     let item: &gtk4::ListItem = item.downcast_ref().unwrap();
-    let Some(tree_row) = item.item().and_then(|o| o.downcast::<gtk4::TreeListRow>().ok()) else {
+    let Some(tree_row) = item
+        .item()
+        .and_then(|o| o.downcast::<gtk4::TreeListRow>().ok())
+    else {
         return;
     };
     let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else {
         return;
     };
-    let Some(expander) = item.child().and_then(|c| c.downcast::<gtk4::TreeExpander>().ok())
+    let Some(expander) = item
+        .child()
+        .and_then(|c| c.downcast::<gtk4::TreeExpander>().ok())
     else {
         return;
     };
@@ -714,7 +822,11 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             set_mime_icon(&w.main_icon, &strip_wildcard(&mime));
             w.main_label.set_text(&mime);
             w.main_label.add_css_class("mime-category");
-            set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
+            set_handler_inline(
+                &w.handler_icon,
+                &w.handler_label,
+                handlers.first().map(String::as_str),
+            );
             w.badge.set_text("");
 
             if !handlers.is_empty() {
@@ -728,36 +840,57 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                         move |desktop| undo::set_category_default(&mime, &desktop, &handlers)
                     },
                 ));
+                w.actions.append(&simple_btn(
+                    "user-trash-symbolic",
+                    "Clear default",
+                    wiring,
+                    {
+                        let mime = mime.clone();
+                        let handlers = handlers.clone();
+                        move || undo::clear_category_default(&mime, &handlers)
+                    },
+                ));
             }
-            w.actions.append(&pick_btn("list-add-symbolic", "Add handler", wiring, {
-                let mime = mime.clone();
-                let handlers_empty = handlers.is_empty();
-                move |desktop| {
-                    if handlers_empty {
-                        undo::set_category_default(&mime, &desktop, &[])
-                    } else {
-                        undo::add_handler(&mime, &desktop)
+            w.actions
+                .append(&pick_btn("list-add-symbolic", "Add handler", wiring, {
+                    let mime = mime.clone();
+                    let handlers_empty = handlers.is_empty();
+                    move |desktop| {
+                        if handlers_empty {
+                            undo::set_category_default(&mime, &desktop, &[])
+                        } else {
+                            undo::add_handler(&mime, &desktop)
+                        }
                     }
-                }
-            }));
-            let except = make_action_btn("mail-message-new-symbolic", "Add exception");
-            let wiring_cl = wiring.clone();
-            except.connect_clicked(move |_| open_add_exception_dialog(&wiring_cl, &mime));
-            w.actions.append(&except);
+                }));
         }
         Row::Exception { mime, handlers } => {
             set_mime_icon(&w.main_icon, &mime);
             w.main_label.set_text(&mime);
             w.main_label.add_css_class("mime-exception");
-            set_handler_inline(&w.handler_icon, &w.handler_label, handlers.first().map(String::as_str));
+            set_handler_inline(
+                &w.handler_icon,
+                &w.handler_label,
+                handlers.first().map(String::as_str),
+            );
 
             if handlers.is_empty() {
-                // Pending (not yet configured in handlr). No handler to remove; offer Set.
+                // Pending (not yet configured in handlr). Offer Remove and Set.
                 w.badge.set_text("");
-                w.actions.append(&pick_btn("list-add-symbolic", "Set handler", wiring, {
-                    let mime = mime.clone();
-                    move |desktop| undo::set_category_default(&mime, &desktop, &[])
-                }));
+                w.actions.append(&simple_btn(
+                    "user-trash-symbolic",
+                    "Remove exception",
+                    wiring,
+                    {
+                        let mime = mime.clone();
+                        move || undo::remove_exception(&mime, &[])
+                    },
+                ));
+                w.actions
+                    .append(&pick_btn("list-add-symbolic", "Set handler", wiring, {
+                        let mime = mime.clone();
+                        move |desktop| undo::set_category_default(&mime, &desktop, &[])
+                    }));
             } else {
                 w.badge.set_text("");
                 w.actions.append(&pick_btn(
@@ -774,30 +907,80 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
                     "user-trash-symbolic",
                     "Remove exception",
                     wiring,
-                    move || undo::remove_exception(&mime, &handlers),
+                    {
+                        let mime = mime.clone();
+                        let handlers = handlers.clone();
+                        move || undo::remove_exception(&mime, &handlers)
+                    },
                 ));
+                w.actions
+                    .append(&pick_btn("list-add-symbolic", "Add handler", wiring, {
+                        let mime = mime.clone();
+                        move |desktop| undo::add_handler(&mime, &desktop)
+                    }));
             }
         }
-        Row::Handler { mime, desktop, index, .. } => {
+        Row::Handler {
+            mime,
+            desktop,
+            index,
+            ..
+        } => {
             let info = gio::DesktopAppInfo::new(&desktop);
+            // Left side empty — app appears on the right to match the default handler position.
+            w.main_icon.set_visible(false);
+            w.main_label.set_text("");
             if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
-                w.main_icon.set_from_gicon(&g);
+                w.handler_icon.set_from_gicon(&g);
             } else {
-                w.main_icon.set_icon_name(Some("applications-other-symbolic"));
+                w.handler_icon
+                    .set_icon_name(Some("applications-other-symbolic"));
             }
-            w.main_label.set_text(&handler_display_name(&desktop, info.as_ref()));
-            w.handler_icon.set_visible(false);
-            w.handler_label.set_text("");
-            w.badge.set_text("");
+            w.handler_icon.set_visible(true);
+            w.handler_label
+                .set_text(&handler_display_name(&desktop, info.as_ref()));
+            w.badge.set_text("Alternative");
             // create_children only emits index >= 1, but be defensive: index 0 has no action.
             if index > 0 {
+                let up_btn = make_action_btn("go-up-symbolic", "Promote handler");
+                {
+                    let wiring_cl = wiring.clone();
+                    let mime_cl = mime.clone();
+                    up_btn.connect_clicked(move |_| {
+                        let handlers: Vec<String> = wiring_cl
+                            .state
+                            .borrow()
+                            .state()
+                            .defaults
+                            .iter()
+                            .find(|(m, _)| m == &mime_cl)
+                            .map(|(_, h)| h.clone())
+                            .unwrap_or_default();
+                        if let Some(entry) = undo::move_handler_up(&mime_cl, &handlers, index) {
+                            apply_entry(&wiring_cl, entry);
+                        }
+                    });
+                }
                 w.actions.append(&simple_btn(
                     "user-trash-symbolic",
                     "Remove handler",
                     wiring,
                     move || undo::remove_handler(&mime, &desktop),
                 ));
+                w.actions.append(&up_btn);
             }
+        }
+        Row::AddException { category_mime } => {
+            w.main_icon.set_visible(false);
+            w.main_label.set_text("");
+            w.handler_icon.set_visible(false);
+            w.handler_label.set_text("");
+            w.badge.set_text("");
+            let btn = gtk4::Button::with_label("＋  Add exception");
+            btn.add_css_class("flat");
+            let wiring_cl = wiring.clone();
+            btn.connect_clicked(move |_| open_add_exception_dialog(&wiring_cl, &category_mime));
+            w.actions.append(&btn);
         }
     }
 }
@@ -827,8 +1010,12 @@ fn set_handler_inline(icon: &gtk4::Image, label: &gtk4::Label, desktop: Option<&
 // handlr::humanize: we keep the full reverse-DNS id (e.g. "org.gnome.Nautilus") so the
 // user sees what failed to resolve, rather than the capitalized last component.
 fn handler_display_name(desktop: &str, info: Option<&gio::DesktopAppInfo>) -> String {
-    info.map(|a| a.name().to_string())
-        .unwrap_or_else(|| desktop.strip_suffix(".desktop").unwrap_or(desktop).to_string())
+    info.map(|a| a.name().to_string()).unwrap_or_else(|| {
+        desktop
+            .strip_suffix(".desktop")
+            .unwrap_or(desktop)
+            .to_string()
+    })
 }
 
 // Build an action button that opens the picker and applies an UndoEntry derived from
@@ -946,8 +1133,7 @@ fn show_app_picker(
         if needle.is_empty() {
             return true;
         }
-        ao.name().to_lowercase().contains(&needle)
-            || ao.desktop().to_lowercase().contains(&needle)
+        ao.name().to_lowercase().contains(&needle) || ao.desktop().to_lowercase().contains(&needle)
     });
 
     let filter_model = gtk4::FilterListModel::new(Some(store), Some(filter.clone()));
@@ -981,7 +1167,8 @@ fn show_app_picker(
             return;
         };
         let (Some(image), Some(label)) = (
-            row.first_child().and_then(|w| w.downcast::<gtk4::Image>().ok()),
+            row.first_child()
+                .and_then(|w| w.downcast::<gtk4::Image>().ok()),
             row.first_child()
                 .and_then(|w| w.next_sibling())
                 .and_then(|w| w.downcast::<gtk4::Label>().ok()),
@@ -1025,10 +1212,7 @@ fn show_app_picker(
             if let Some(model) = lv.model()
                 && model.n_items() > 0
             {
-                let _ = lv.activate_action(
-                    "list.activate-item",
-                    Some(&glib::Variant::from(0u32)),
-                );
+                let _ = lv.activate_action("list.activate-item", Some(&glib::Variant::from(0u32)));
             }
         });
     }
@@ -1050,6 +1234,22 @@ fn show_app_picker(
             glib::Propagation::Proceed
         });
         search.add_controller(key_ctrl);
+    }
+
+    // GtkSearchEntry consumes Escape (to clear text), so intercept it at capture phase
+    // on the popover before any child sees it.
+    {
+        let popover_for_esc = popover.clone();
+        let esc_ctrl = gtk4::EventControllerKey::new();
+        esc_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        esc_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                popover_for_esc.popdown();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        popover.add_controller(esc_ctrl);
     }
 
     // Drop the popover (and its parent reference) when it closes so it doesn't leak.
@@ -1134,21 +1334,25 @@ fn open_add_exception_dialog(wiring: &Wiring, category_mime: &str) {
                 .build();
             let entry = entry.clone();
             let error_label = error_label.clone();
-            file_dialog.open(Some(&dialog_parent), gio::Cancellable::NONE, move |result| {
-                let Ok(file) = result else { return }; // user cancelled
-                let Some(path) = file.path() else { return };
-                match handlr::detect_mime(&path) {
-                    Ok(mime) => {
-                        entry.set_text(&mime);
-                        entry.set_position(mime.len() as i32);
-                        error_label.set_visible(false);
+            file_dialog.open(
+                Some(&dialog_parent),
+                gio::Cancellable::NONE,
+                move |result| {
+                    let Ok(file) = result else { return }; // user cancelled
+                    let Some(path) = file.path() else { return };
+                    match handlr::detect_mime(&path) {
+                        Ok(mime) => {
+                            entry.set_text(&mime);
+                            entry.set_position(mime.len() as i32);
+                            error_label.set_visible(false);
+                        }
+                        Err(e) => {
+                            error_label.set_text(&format!("Failed to detect MIME: {}", e));
+                            error_label.set_visible(true);
+                        }
                     }
-                    Err(e) => {
-                        error_label.set_text(&format!("Failed to detect MIME: {}", e));
-                        error_label.set_visible(true);
-                    }
-                }
-            });
+                },
+            );
         });
     }
 
@@ -1194,6 +1398,19 @@ fn open_add_exception_dialog(wiring: &Wiring, category_mime: &str) {
         move |_| proceed()
     });
     entry.connect_activate(move |_| proceed());
+
+    {
+        let dialog_for_key = dialog.clone();
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                dialog_for_key.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_ctrl);
+    }
 
     dialog.present();
     entry.grab_focus();
@@ -1352,10 +1569,7 @@ fn build_settings_dialog(
     dlg
 }
 
-fn apply_config_save(
-    config: &Rc<RefCell<crate::config::Config>>,
-    err_label: &gtk4::Label,
-) {
+fn apply_config_save(config: &Rc<RefCell<crate::config::Config>>, err_label: &gtk4::Label) {
     match crate::config::save(&config.borrow()) {
         Ok(()) => err_label.set_visible(false),
         Err(e) => {
@@ -1466,7 +1680,10 @@ pub(crate) fn build_regex_handlers_tab(
         .state()
         .system_apps
         .iter()
-        .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+        .map(|a| handlr::App {
+            desktop: a.desktop.clone(),
+            name: a.name.clone(),
+        })
         .collect();
 
     rebuild_handler_cards(&cards_box, &config, &apps);
@@ -1503,7 +1720,10 @@ pub(crate) fn build_regex_handlers_tab(
                 .state()
                 .system_apps
                 .iter()
-                .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+                .map(|a| handlr::App {
+                    desktop: a.desktop.clone(),
+                    name: a.name.clone(),
+                })
                 .collect();
             rebuild_handler_cards(&cards_box, &config, &apps);
         }
@@ -1522,12 +1742,7 @@ fn rebuild_handler_cards(
     }
     let n = config.borrow().handlers.len();
     for idx in 0..n {
-        let card = build_handler_card(
-            Some(idx),
-            config.clone(),
-            cards_box.clone(),
-            apps.to_vec(),
-        );
+        let card = build_handler_card(Some(idx), config.clone(), cards_box.clone(), apps.to_vec());
         cards_box.append(&card);
     }
 }
@@ -1557,7 +1772,11 @@ fn build_handler_card(
     header.set_margin_end(8);
 
     let toggle_btn = gtk4::ToggleButton::new();
-    toggle_btn.set_icon_name(if is_new { "pan-down-symbolic" } else { "pan-end-symbolic" });
+    toggle_btn.set_icon_name(if is_new {
+        "pan-down-symbolic"
+    } else {
+        "pan-end-symbolic"
+    });
     toggle_btn.add_css_class("flat");
     toggle_btn.set_active(is_new);
 
@@ -2009,7 +2228,8 @@ fn looks_like_mime(s: &str) -> bool {
         && !s.starts_with('~')
         && s.contains('/')
         && !s.contains(' ')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || ".-+_/".contains(c))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-+_/".contains(c))
 }
 
 fn resolve_input(
@@ -2024,7 +2244,12 @@ fn resolve_input(
     // We collect ALL attempts (including skipped ones after the first match) for display.
     let mut winner: Option<(usize, String)> = None; // (handler_idx, winning_pattern)
     for (idx, handler) in config.handlers.iter().enumerate() {
-        let exec_short = handler.exec.split_whitespace().next().unwrap_or(&handler.exec).to_string();
+        let exec_short = handler
+            .exec
+            .split_whitespace()
+            .next()
+            .unwrap_or(&handler.exec)
+            .to_string();
         for pattern in &handler.regexes {
             if winner.is_some() {
                 regex_attempts.push(RegexAttempt {
@@ -2055,7 +2280,10 @@ fn resolve_input(
         let handler = &config.handlers[idx];
         let display_name = resolve_exec_name(&handler.exec, apps);
         return Resolution {
-            kind: ResolutionKind::Regex { handler_idx: idx, pattern: pattern.clone() },
+            kind: ResolutionKind::Regex {
+                handler_idx: idx,
+                pattern: pattern.clone(),
+            },
             display_name,
             icon: resolve_app_icon(&handler.exec, apps),
             regex_attempts,
@@ -2099,10 +2327,7 @@ fn resolve_input(
     }
 }
 
-fn build_resolution_display(
-    results_box: &gtk4::Box,
-    resolution: &Resolution,
-) {
+fn build_resolution_display(results_box: &gtk4::Box, resolution: &Resolution) {
     // Winner card.
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     card.add_css_class("card");
@@ -2136,8 +2361,15 @@ fn build_resolution_display(
 
     // Reason row.
     let reason_text = match &resolution.kind {
-        ResolutionKind::Regex { handler_idx, pattern } => {
-            format!("Matched regex handler #{} — pattern: {}", handler_idx + 1, pattern)
+        ResolutionKind::Regex {
+            handler_idx,
+            pattern,
+        } => {
+            format!(
+                "Matched regex handler #{} — pattern: {}",
+                handler_idx + 1,
+                pattern
+            )
         }
         ResolutionKind::MimeDefault { mime } => {
             format!("Default handler for MIME type {}", mime)
@@ -2185,7 +2417,11 @@ fn build_resolution_display(
         let header_text = if n == 0 {
             "Resolution chain (no regex handlers configured)".to_string()
         } else {
-            format!("Resolution chain ({} regex pattern{} checked)", n, if n == 1 { "" } else { "s" })
+            format!(
+                "Resolution chain ({} regex pattern{} checked)",
+                n,
+                if n == 1 { "" } else { "s" }
+            )
         };
         let chain_header = gtk4::Label::new(Some(&header_text));
         chain_header.add_css_class("heading");
@@ -2196,7 +2432,13 @@ fn build_resolution_display(
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             row.set_margin_top(2);
 
-            let tick_text = if attempt.skipped { "—" } else if attempt.matched { "✓" } else { "✗" };
+            let tick_text = if attempt.skipped {
+                "—"
+            } else if attempt.matched {
+                "✓"
+            } else {
+                "✗"
+            };
             let tick = gtk4::Label::new(Some(tick_text));
             if attempt.matched {
                 tick.add_css_class("success");
@@ -2316,9 +2558,7 @@ pub(crate) fn build_tester_tab(
 
     // Input entry.
     let entry = gtk4::Entry::new();
-    entry.set_placeholder_text(Some(
-        "Drop a file or type a URL, file path, or MIME type…",
-    ));
+    entry.set_placeholder_text(Some("Drop a file or type a URL, file path, or MIME type…"));
     entry.set_hexpand(true);
     inner.append(&entry);
 
@@ -2367,7 +2607,10 @@ pub(crate) fn build_tester_tab(
                 .state()
                 .system_apps
                 .iter()
-                .map(|a| handlr::App { desktop: a.desktop.clone(), name: a.name.clone() })
+                .map(|a| handlr::App {
+                    desktop: a.desktop.clone(),
+                    name: a.name.clone(),
+                })
                 .collect();
             let cfg = config.borrow();
             let st = state.borrow();

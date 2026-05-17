@@ -19,6 +19,7 @@ pub(crate) enum Row {
         #[allow(dead_code)]
         total: usize,
     },
+    AddException { category_mime: String },
 }
 
 pub(crate) const SEED_CATEGORIES: &[&str] = &[

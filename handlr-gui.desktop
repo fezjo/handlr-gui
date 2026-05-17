@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Handlr GUI
+Comment=Manage MIME type default handlers
+Exec=handlr-gui
+Icon=preferences-desktop-default-applications
+Terminal=false
+Type=Application
+Categories=Settings;
+Keywords=mime;handler;association;default;
