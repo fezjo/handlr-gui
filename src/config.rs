@@ -223,6 +223,9 @@ mod tests {
         assert_eq!(loaded.handlers.len(), 2);
         assert_eq!(loaded.handlers[0].regexes.len(), 2);
         assert_eq!(loaded.handlers[1].exec, "transmission-gtk %u");
+        assert_eq!(loaded.handlers[0].regexes[0], "https://youtu\\.be/.*");
+        assert_eq!(loaded.handlers[0].exec, "freetube %u");
+        assert!(!loaded.handlers[0].terminal);
     }
 
     #[test]
@@ -246,6 +249,24 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("[[handlers]]"), "handlers section should be absent");
+    }
+
+    #[test]
+    fn terminal_flag_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handlr.toml");
+        let cfg = Config {
+            handlers: vec![RegexHandler {
+                regexes: vec!["magnet:.*".into()],
+                exec: "transmission-cli %u".into(),
+                terminal: true,
+            }],
+            ..Default::default()
+        };
+        save_to(&cfg, &path).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.handlers.len(), 1);
+        assert!(loaded.handlers[0].terminal);
     }
 
     #[test]
