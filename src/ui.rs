@@ -2240,19 +2240,57 @@ fn build_resolution_display(
             chain_box.append(&row);
         }
 
-        // If we fell through to MIME, show what the MIME fallback is.
-        if !matches!(&resolution.kind, ResolutionKind::Regex { .. })
-            && let Some(mime) = &resolution.detected_mime
-        {
-            let fallback_label = gtk4::Label::new(Some(&format!(
-                "→ Fell through to MIME: {}",
-                mime
-            )));
-            fallback_label.add_css_class("dim-label");
-            fallback_label.set_halign(gtk4::Align::Start);
-            fallback_label.set_margin_top(4);
-            chain_box.append(&fallback_label);
-        }
+        // MIME fallback rows — always shown so the full chain is visible.
+        let regex_matched = matches!(&resolution.kind, ResolutionKind::Regex { .. });
+
+        // Separator before MIME section.
+        let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep.set_margin_top(4);
+        sep.set_margin_bottom(2);
+        chain_box.append(&sep);
+
+        // MIME detection row.
+        let mime_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let mime_tick = gtk4::Label::new(Some(if regex_matched { "—" } else { "→" }));
+        mime_tick.add_css_class("dim-label");
+        mime_row.append(&mime_tick);
+        let mime_text = if regex_matched {
+            "MIME detection (not evaluated)".to_string()
+        } else {
+            match &resolution.detected_mime {
+                Some(m) => format!("MIME: {}", m),
+                None => "MIME detection failed".to_string(),
+            }
+        };
+        let mime_label = gtk4::Label::new(Some(&mime_text));
+        mime_label.add_css_class("dim-label");
+        mime_label.set_xalign(0.0);
+        mime_label.set_hexpand(true);
+        mime_row.append(&mime_label);
+        chain_box.append(&mime_row);
+
+        // MIME handler lookup row.
+        let handler_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let handler_tick = gtk4::Label::new(Some(if regex_matched { "—" } else { "→" }));
+        handler_tick.add_css_class("dim-label");
+        handler_row.append(&handler_tick);
+        let handler_text = if regex_matched {
+            "MIME handler lookup (not evaluated)".to_string()
+        } else {
+            match &resolution.kind {
+                ResolutionKind::MimeDefault { .. } => {
+                    format!("Handler: {}", resolution.display_name)
+                }
+                ResolutionKind::NoHandler { .. } => "No handler configured".to_string(),
+                ResolutionKind::Regex { .. } => unreachable!(),
+            }
+        };
+        let handler_label = gtk4::Label::new(Some(&handler_text));
+        handler_label.add_css_class("dim-label");
+        handler_label.set_xalign(0.0);
+        handler_label.set_hexpand(true);
+        handler_row.append(&handler_label);
+        chain_box.append(&handler_row);
 
         results_box.append(&chain_box);
     }
