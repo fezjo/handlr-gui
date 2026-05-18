@@ -413,6 +413,8 @@ pub(crate) fn node_to_row(node: &'static NodeDef, state: &handlr::State) -> Row 
     }
 }
 
+/// Returns `Some(desktop)` iff every MIME in the group has the same first handler.
+/// Returns `None` when all MIMEs are unset OR when handlers disagree across MIMEs.
 fn compute_display_handler(prior_handlers: &[Vec<String>]) -> Option<String> {
     let firsts: Vec<&str> = prior_handlers
         .iter()

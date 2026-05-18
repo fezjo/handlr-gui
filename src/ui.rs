@@ -676,6 +676,9 @@ fn delete_target(list_view: &gtk4::ListView) -> Option<UndoEntry> {
         .and_then(|o| o.downcast::<RowObject>().ok())?;
     match row_obj.row() {
         Row::SemanticGroup { .. } => None,
+        // Delete on a batch header is ambiguous (which MIME to clear?). No-op; user
+        // should expand the group and delete individual BatchMime rows instead.
+        Row::BatchGroup { .. } => None,
         Row::BatchMime { mime, mime_handlers, .. } if !mime_handlers.is_empty() => {
             Some(undo::revert_to_inherited(&mime, &mime_handlers))
         }
@@ -1140,7 +1143,7 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
     }
 }
 
-// Render the "Inherited" state for a GroupMime row with no specific override.
+// Render the "Inherited" state for a BatchMime row with no specific override.
 // Shows the group handler's icon (if any) with the label "Inherited".
 fn set_handler_inherited(icon: &gtk4::Image, label: &gtk4::Label, group_handler: Option<&str>) {
     match group_handler {
