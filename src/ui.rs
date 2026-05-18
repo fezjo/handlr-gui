@@ -104,6 +104,7 @@ struct Wiring {
     state: Rc<RefCell<AppState>>,
     root_store: gio::ListStore,
     tree_model: gtk4::TreeListModel,
+    selection: gtk4::SingleSelection,
     scrolled: gtk4::ScrolledWindow,
     stack: gtk4::Stack,
     undo_btn: gtk4::Button,
@@ -128,7 +129,12 @@ pub(crate) struct TreeHandle {
 // Repopulate the root store from the current AppState. Call after mutating
 // AppState without going through apply/undo/redo (e.g. add_pending_exception).
 pub(crate) fn rebuild_tree(handle: &TreeHandle, state: &std::rc::Rc<std::cell::RefCell<AppState>>) {
-    populate_root(&handle.root_store, &handle.tree_model, state, &handle.scrolled);
+    let selection = handle.list_view
+        .model()
+        .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok());
+    if let Some(sel) = selection {
+        populate_root(&handle.root_store, &handle.tree_model, state, &handle.scrolled, &sel);
+    }
 }
 
 pub(crate) fn build_window(
@@ -197,7 +203,7 @@ pub(crate) fn build_window(
     // Build the list view shell first (model + factory setup, no bind callback yet)
     // so we can put it in TreeHandle and attach bind_row after Wiring is constructed.
     let root_store = gio::ListStore::new::<RowObject>();
-    let (list_view, factory, tree_model) = build_list_view(root_store.clone(), state.clone());
+    let (list_view, factory, tree_model, selection) = build_list_view(root_store.clone(), state.clone());
 
     let scrolled = gtk4::ScrolledWindow::new();
     scrolled.set_overlay_scrolling(false);
@@ -208,6 +214,7 @@ pub(crate) fn build_window(
         state: state.clone(),
         root_store: root_store.clone(),
         tree_model: tree_model.clone(),
+        selection: selection.clone(),
         scrolled: scrolled.clone(),
         stack: stack.clone(),
         undo_btn: undo_btn.clone(),
@@ -606,7 +613,7 @@ fn apply_entry(wiring: &Wiring, entry: UndoEntry) {
 }
 
 fn refresh_view(wiring: &Wiring) {
-    populate_root(&wiring.root_store, &wiring.tree_model, &wiring.state, &wiring.scrolled);
+    populate_root(&wiring.root_store, &wiring.tree_model, &wiring.state, &wiring.scrolled, &wiring.selection);
     update_stack(&wiring.stack, &wiring.state);
     refresh_header(&wiring.state, &wiring.undo_btn, &wiring.redo_btn);
 }
@@ -637,11 +644,19 @@ fn populate_root(
     tree_model: &gtk4::TreeListModel,
     state: &Rc<RefCell<AppState>>,
     scrolled: &gtk4::ScrolledWindow,
+    selection: &gtk4::SingleSelection,
 ) {
-    // Save expand state and scroll position before rebuild.
+    // Save expand state, scroll position, and selected row key before rebuild.
     let (expanded_keys, existed_keys) = collect_row_state(tree_model);
     let has_prior_state = tree_model.n_items() > 0;
     let scroll_pos = scrolled.vadjustment().value();
+    let selected_key: Option<String> = {
+        let pos = selection.selected();
+        selection.item(pos)
+            .and_then(|o| o.downcast::<gtk4::TreeListRow>().ok())
+            .and_then(|tr| tr.item().and_then(|o| o.downcast::<RowObject>().ok()))
+            .and_then(|ro| selection_key(&ro.row()))
+    };
 
     root_store.remove_all();
     let s = state.borrow();
@@ -681,6 +696,20 @@ fn populate_root(
         }
     }
 
+    // Restore selected row by key, falling back to no change if not found.
+    if let Some(key) = selected_key {
+        let n = tree_model.n_items();
+        for i in 0..n {
+            let Some(obj) = tree_model.item(i) else { continue };
+            let Some(tree_row) = obj.downcast::<gtk4::TreeListRow>().ok() else { continue };
+            let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else { continue };
+            if selection_key(&row_obj.row()).as_deref() == Some(key.as_str()) {
+                selection.set_selected(i);
+                break;
+            }
+        }
+    }
+
     // Restore scroll position after GTK has relaid out the new content.
     if has_prior_state {
         let scrolled = scrolled.clone();
@@ -709,8 +738,7 @@ fn collect_row_state(tree_model: &gtk4::TreeListModel) -> (HashSet<String>, Hash
     (expanded, existed)
 }
 
-// Stable key identifying a row across rebuilds. None for leaf rows (BatchMime, Handler, etc.)
-// that don't need expand-state tracking.
+// Stable key for expand-state tracking. Covers only expandable row types.
 fn row_key(row: &Row) -> Option<String> {
     match row {
         Row::SemanticGroup { name, .. } => Some(format!("sg:{name}")),
@@ -718,6 +746,20 @@ fn row_key(row: &Row) -> Option<String> {
         Row::Category { mime, .. } => Some(format!("cat:{mime}")),
         Row::Exception { mime, .. } => Some(format!("exc:{mime}")),
         _ => None,
+    }
+}
+
+// Stable key for selection tracking. Covers all row types so the selected row
+// can be restored across rebuilds even for leaf rows.
+fn selection_key(row: &Row) -> Option<String> {
+    match row {
+        Row::SemanticGroup { name, .. } => Some(format!("sg:{name}")),
+        Row::BatchGroup { name, .. } => Some(format!("bg:{name}")),
+        Row::BatchMime { mime, .. } => Some(format!("bm:{mime}")),
+        Row::Category { mime, .. } => Some(format!("cat:{mime}")),
+        Row::Exception { mime, .. } => Some(format!("exc:{mime}")),
+        Row::Handler { mime, desktop, .. } => Some(format!("h:{mime}:{desktop}")),
+        Row::AddException { category_mime } => Some(format!("add:{category_mime}")),
     }
 }
 
@@ -765,15 +807,13 @@ fn delete_target(list_view: &gtk4::ListView) -> Option<UndoEntry> {
     }
 }
 
-// Returns (list_view, factory, tree_model). factory is returned so the caller can attach
-// connect_bind after Wiring is constructed — bind_row needs Wiring, and Wiring carries
-// the list_view. tree_model is needed to collapse Group rows after populate_root.
+// Returns (list_view, factory, tree_model, selection). factory is returned so the caller
+// can attach connect_bind after Wiring is constructed. tree_model + selection are needed
+// for state preservation in populate_root.
 fn build_list_view(
     root_store: gio::ListStore,
     state: Rc<RefCell<AppState>>,
-) -> (gtk4::ListView, gtk4::SignalListItemFactory, gtk4::TreeListModel) {
-    // passthrough=false, autoexpand=true: categories auto-expand; groups are collapsed
-    // back to default in populate_root after append.
+) -> (gtk4::ListView, gtk4::SignalListItemFactory, gtk4::TreeListModel, gtk4::SingleSelection) {
     let tree_model =
         gtk4::TreeListModel::new(root_store, false, true, move |parent_obj: &glib::Object| {
             create_children(parent_obj, &state)
@@ -785,9 +825,9 @@ fn build_list_view(
     let right_col_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Horizontal);
     factory.connect_setup(move |f, item| setup_row(f, item, &right_col_group));
 
-    let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
+    let list_view = gtk4::ListView::new(Some(selection.clone()), Some(factory.clone()));
     list_view.add_css_class("defaults-list");
-    (list_view, factory, tree_model)
+    (list_view, factory, tree_model, selection)
 }
 
 fn create_children(
@@ -1013,21 +1053,26 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             w.main_icon.set_visible(true);
             w.main_label.set_text(&mime);
             w.main_label.set_visible(true);
-            set_badge(&w.badge, "");
             if mime_handlers.is_empty() {
-                set_handler_inherited(&w.handler_icon, &w.handler_label, group_handler.as_deref());
+                // Not set — no explicit handlr entry for this MIME.
+                w.handler_icon.set_visible(false);
+                w.handler_label.set_text("(not set)");
+                set_badge(&w.badge, "");
                 w.actions.append(&pick_btn("list-add-symbolic", "Set specific handler", wiring, {
                     let mime_cl = mime.clone();
                     move |desktop| undo::set_category_default(&mime_cl, &desktop, &[])
                 }));
             } else {
+                // Explicitly set: either matching the group handler ("(set)") or overriding it.
+                let matches_group = group_handler.as_deref() == mime_handlers.first().map(String::as_str);
                 set_handler_inline(&w.handler_icon, &w.handler_label, mime_handlers.first().map(String::as_str));
+                set_badge(&w.badge, if matches_group { "(set)" } else { "" });
                 w.actions.append(&pick_btn("document-edit-symbolic", "Change handler", wiring, {
                     let mime_cl = mime.clone();
                     let handlers_cl = mime_handlers.clone();
                     move |desktop| undo::set_category_default(&mime_cl, &desktop, &handlers_cl)
                 }));
-                w.actions.append(&simple_btn("user-trash-symbolic", "Revert to inherited", wiring, {
+                w.actions.append(&simple_btn("user-trash-symbolic", "Remove specific handler", wiring, {
                     let mime_cl = mime.clone();
                     let handlers_cl = mime_handlers.clone();
                     move || undo::revert_to_inherited(&mime_cl, &handlers_cl)
@@ -1210,27 +1255,6 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             let wiring_cl = wiring.clone();
             btn.connect_clicked(move |_| open_add_exception_dialog(&wiring_cl, &category_mime));
             w.actions.append(&btn);
-        }
-    }
-}
-
-// Render the "Inherited" state for a BatchMime row with no specific override.
-// Shows the group handler's icon (if any) with the label "Inherited".
-fn set_handler_inherited(icon: &gtk4::Image, label: &gtk4::Label, group_handler: Option<&str>) {
-    match group_handler {
-        Some(d) => {
-            let info = gio::DesktopAppInfo::new(d);
-            if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
-                icon.set_from_gicon(&g);
-            } else {
-                icon.set_icon_name(Some("applications-other-symbolic"));
-            }
-            icon.set_visible(true);
-            label.set_text("Inherited");
-        }
-        None => {
-            icon.set_visible(false);
-            label.set_text("(not set)");
         }
     }
 }
