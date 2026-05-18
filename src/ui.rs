@@ -10,6 +10,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 
@@ -103,6 +104,7 @@ struct Wiring {
     state: Rc<RefCell<AppState>>,
     root_store: gio::ListStore,
     tree_model: gtk4::TreeListModel,
+    scrolled: gtk4::ScrolledWindow,
     stack: gtk4::Stack,
     undo_btn: gtk4::Button,
     redo_btn: gtk4::Button,
@@ -118,6 +120,7 @@ pub(crate) struct TreeHandle {
     pub(crate) list_view: gtk4::ListView,
     pub(crate) root_store: gio::ListStore,
     pub(crate) tree_model: gtk4::TreeListModel,
+    pub(crate) scrolled: gtk4::ScrolledWindow,
     pub(crate) revealer: gtk4::Revealer,
     pub(crate) info_label: gtk4::Label,
 }
@@ -125,7 +128,7 @@ pub(crate) struct TreeHandle {
 // Repopulate the root store from the current AppState. Call after mutating
 // AppState without going through apply/undo/redo (e.g. add_pending_exception).
 pub(crate) fn rebuild_tree(handle: &TreeHandle, state: &std::rc::Rc<std::cell::RefCell<AppState>>) {
-    populate_root(&handle.root_store, &handle.tree_model, state);
+    populate_root(&handle.root_store, &handle.tree_model, state, &handle.scrolled);
 }
 
 pub(crate) fn build_window(
@@ -196,10 +199,16 @@ pub(crate) fn build_window(
     let root_store = gio::ListStore::new::<RowObject>();
     let (list_view, factory, tree_model) = build_list_view(root_store.clone(), state.clone());
 
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_overlay_scrolling(false);
+    scrolled.set_child(Some(&list_view));
+    stack.add_named(&scrolled, Some("tree"));
+
     let wiring = Wiring {
         state: state.clone(),
         root_store: root_store.clone(),
         tree_model: tree_model.clone(),
+        scrolled: scrolled.clone(),
         stack: stack.clone(),
         undo_btn: undo_btn.clone(),
         redo_btn: redo_btn.clone(),
@@ -213,11 +222,6 @@ pub(crate) fn build_window(
         let wiring = wiring.clone();
         factory.connect_bind(move |_factory, item| bind_row(item, &wiring));
     }
-
-    let scrolled = gtk4::ScrolledWindow::new();
-    scrolled.set_overlay_scrolling(false);
-    scrolled.set_child(Some(&list_view));
-    stack.add_named(&scrolled, Some("tree"));
 
     let empty_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     empty_box.set_halign(gtk4::Align::Center);
@@ -454,6 +458,7 @@ pub(crate) fn build_window(
         list_view: list_view.clone(),
         root_store: root_store.clone(),
         tree_model: tree_model.clone(),
+        scrolled: scrolled.clone(),
         revealer: revealer.clone(),
         info_label: info_label.clone(),
     };
@@ -601,7 +606,7 @@ fn apply_entry(wiring: &Wiring, entry: UndoEntry) {
 }
 
 fn refresh_view(wiring: &Wiring) {
-    populate_root(&wiring.root_store, &wiring.tree_model, &wiring.state);
+    populate_root(&wiring.root_store, &wiring.tree_model, &wiring.state, &wiring.scrolled);
     update_stack(&wiring.stack, &wiring.state);
     refresh_header(&wiring.state, &wiring.undo_btn, &wiring.redo_btn);
 }
@@ -627,7 +632,17 @@ fn update_stack(stack: &gtk4::Stack, _state: &Rc<RefCell<AppState>>) {
     stack.set_visible_child_name("tree");
 }
 
-fn populate_root(root_store: &gio::ListStore, tree_model: &gtk4::TreeListModel, state: &Rc<RefCell<AppState>>) {
+fn populate_root(
+    root_store: &gio::ListStore,
+    tree_model: &gtk4::TreeListModel,
+    state: &Rc<RefCell<AppState>>,
+    scrolled: &gtk4::ScrolledWindow,
+) {
+    // Save expand state and scroll position before rebuild.
+    let (expanded_keys, existed_keys) = collect_row_state(tree_model);
+    let has_prior_state = tree_model.n_items() > 0;
+    let scroll_pos = scrolled.vadjustment().value();
+
     root_store.remove_all();
     let s = state.borrow();
     for row in model::build_root_rows(s.state()) {
@@ -637,16 +652,72 @@ fn populate_root(root_store: &gio::ListStore, tree_model: &gtk4::TreeListModel, 
         root_store.append(&RowObject::new(row));
     }
     drop(s);
-    // With autoexpand=true all rows expand on insert. Collapse SemanticGroup and BatchGroup
-    // rows so their children are hidden by default. Iterate in reverse to avoid index shifts.
+
+    // After autoexpand=true all rows are expanded. Restore prior state, or collapse
+    // SemanticGroup/BatchGroup by default on first load. Reverse order avoids index
+    // shifts: when we collapse a parent its children (already processed) are removed.
     let n = tree_model.n_items();
     for i in (0..n).rev() {
         let Some(tree_row) = tree_model.item(i).and_then(|o| o.downcast::<gtk4::TreeListRow>().ok()) else { continue };
-        if tree_row.depth() != 0 { continue; }
+        if !tree_row.is_expandable() { continue; }
         let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else { continue };
-        if matches!(row_obj.row(), Row::SemanticGroup { .. } | Row::BatchGroup { .. }) {
+        let row = row_obj.row();
+        let should_collapse = match &row {
+            // Collapsed by default; restore to open only if user had expanded them.
+            Row::SemanticGroup { .. } | Row::BatchGroup { .. } => {
+                !row_key(&row).map(|k| expanded_keys.contains(&k)).unwrap_or(false)
+            }
+            // Open by default; collapse only if user had explicitly closed them.
+            Row::Category { .. } | Row::Exception { .. } => {
+                has_prior_state
+                    && row_key(&row)
+                        .map(|k| existed_keys.contains(&k) && !expanded_keys.contains(&k))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if should_collapse {
             tree_row.set_expanded(false);
         }
+    }
+
+    // Restore scroll position after GTK has relaid out the new content.
+    if has_prior_state {
+        let scrolled = scrolled.clone();
+        glib::idle_add_local_once(move || {
+            scrolled.vadjustment().set_value(scroll_pos);
+        });
+    }
+}
+
+// Returns (expanded_keys, existed_keys) for all rows currently visible in the tree.
+fn collect_row_state(tree_model: &gtk4::TreeListModel) -> (HashSet<String>, HashSet<String>) {
+    let mut expanded = HashSet::new();
+    let mut existed = HashSet::new();
+    let n = tree_model.n_items();
+    for i in 0..n {
+        let Some(obj) = tree_model.item(i) else { continue };
+        let Some(tree_row) = obj.downcast::<gtk4::TreeListRow>().ok() else { continue };
+        let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else { continue };
+        if let Some(key) = row_key(&row_obj.row()) {
+            existed.insert(key.clone());
+            if tree_row.is_expanded() {
+                expanded.insert(key);
+            }
+        }
+    }
+    (expanded, existed)
+}
+
+// Stable key identifying a row across rebuilds. None for leaf rows (BatchMime, Handler, etc.)
+// that don't need expand-state tracking.
+fn row_key(row: &Row) -> Option<String> {
+    match row {
+        Row::SemanticGroup { name, .. } => Some(format!("sg:{name}")),
+        Row::BatchGroup { name, .. } => Some(format!("bg:{name}")),
+        Row::Category { mime, .. } => Some(format!("cat:{mime}")),
+        Row::Exception { mime, .. } => Some(format!("exc:{mime}")),
+        _ => None,
     }
 }
 
