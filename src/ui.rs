@@ -12,6 +12,7 @@ use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+
 mod imp {
     use super::*;
     use glib::subclass::prelude::*;
@@ -101,6 +102,7 @@ impl AppObject {
 struct Wiring {
     state: Rc<RefCell<AppState>>,
     root_store: gio::ListStore,
+    tree_model: gtk4::TreeListModel,
     stack: gtk4::Stack,
     undo_btn: gtk4::Button,
     redo_btn: gtk4::Button,
@@ -115,6 +117,7 @@ struct Wiring {
 pub(crate) struct TreeHandle {
     pub(crate) list_view: gtk4::ListView,
     pub(crate) root_store: gio::ListStore,
+    pub(crate) tree_model: gtk4::TreeListModel,
     pub(crate) revealer: gtk4::Revealer,
     pub(crate) info_label: gtk4::Label,
 }
@@ -122,7 +125,7 @@ pub(crate) struct TreeHandle {
 // Repopulate the root store from the current AppState. Call after mutating
 // AppState without going through apply/undo/redo (e.g. add_pending_exception).
 pub(crate) fn rebuild_tree(handle: &TreeHandle, state: &std::rc::Rc<std::cell::RefCell<AppState>>) {
-    populate_root(&handle.root_store, state);
+    populate_root(&handle.root_store, &handle.tree_model, state);
 }
 
 pub(crate) fn build_window(
@@ -191,11 +194,12 @@ pub(crate) fn build_window(
     // Build the list view shell first (model + factory setup, no bind callback yet)
     // so we can put it in TreeHandle and attach bind_row after Wiring is constructed.
     let root_store = gio::ListStore::new::<RowObject>();
-    let (list_view, factory) = build_list_view(root_store.clone(), state.clone());
+    let (list_view, factory, tree_model) = build_list_view(root_store.clone(), state.clone());
 
     let wiring = Wiring {
         state: state.clone(),
         root_store: root_store.clone(),
+        tree_model: tree_model.clone(),
         stack: stack.clone(),
         undo_btn: undo_btn.clone(),
         redo_btn: redo_btn.clone(),
@@ -423,6 +427,21 @@ pub(crate) fn build_window(
                         });
                         glib::Propagation::Stop
                     }
+                    Row::SemanticGroup { .. } => glib::Propagation::Proceed,
+                    Row::BatchGroup { name, mimes, prior_handlers, .. } => {
+                        show_app_picker(anchor, &apps, move |desktop| {
+                            let entry = undo::set_batch_handler(&name, &mimes, &desktop, &prior_handlers);
+                            apply_entry(&wiring_inner, entry);
+                        });
+                        glib::Propagation::Stop
+                    }
+                    Row::BatchMime { mime, mime_handlers, .. } => {
+                        show_app_picker(anchor, &apps, move |desktop| {
+                            let entry = undo::set_category_default(&mime, &desktop, &mime_handlers);
+                            apply_entry(&wiring_inner, entry);
+                        });
+                        glib::Propagation::Stop
+                    }
                     _ => glib::Propagation::Proceed,
                 }
             }
@@ -434,6 +453,7 @@ pub(crate) fn build_window(
     let tree = TreeHandle {
         list_view: list_view.clone(),
         root_store: root_store.clone(),
+        tree_model: tree_model.clone(),
         revealer: revealer.clone(),
         info_label: info_label.clone(),
     };
@@ -581,7 +601,7 @@ fn apply_entry(wiring: &Wiring, entry: UndoEntry) {
 }
 
 fn refresh_view(wiring: &Wiring) {
-    populate_root(&wiring.root_store, &wiring.state);
+    populate_root(&wiring.root_store, &wiring.tree_model, &wiring.state);
     update_stack(&wiring.stack, &wiring.state);
     refresh_header(&wiring.state, &wiring.undo_btn, &wiring.redo_btn);
 }
@@ -602,17 +622,31 @@ fn refresh_header(state: &Rc<RefCell<AppState>>, undo_btn: &gtk4::Button, redo_b
     ));
 }
 
-fn update_stack(stack: &gtk4::Stack, state: &Rc<RefCell<AppState>>) {
-    let s = state.borrow();
-    let any_handlers = s.state().defaults.iter().any(|(_, h)| !h.is_empty());
-    let stack_name = if any_handlers { "tree" } else { "empty" };
-    stack.set_visible_child_name(stack_name);
+fn update_stack(stack: &gtk4::Stack, _state: &Rc<RefCell<AppState>>) {
+    // Groups are always present, so always show the tree.
+    stack.set_visible_child_name("tree");
 }
 
-fn populate_root(root_store: &gio::ListStore, state: &Rc<RefCell<AppState>>) {
+fn populate_root(root_store: &gio::ListStore, tree_model: &gtk4::TreeListModel, state: &Rc<RefCell<AppState>>) {
     root_store.remove_all();
-    for row in model::build_categories(state.borrow().state()) {
+    let s = state.borrow();
+    for row in model::build_root_rows(s.state()) {
         root_store.append(&RowObject::new(row));
+    }
+    for row in model::build_extra_wildcards(s.state()) {
+        root_store.append(&RowObject::new(row));
+    }
+    drop(s);
+    // With autoexpand=true all rows expand on insert. Collapse SemanticGroup and BatchGroup
+    // rows so their children are hidden by default. Iterate in reverse to avoid index shifts.
+    let n = tree_model.n_items();
+    for i in (0..n).rev() {
+        let Some(tree_row) = tree_model.item(i).and_then(|o| o.downcast::<gtk4::TreeListRow>().ok()) else { continue };
+        if tree_row.depth() != 0 { continue; }
+        let Some(row_obj) = tree_row.item().and_then(|o| o.downcast::<RowObject>().ok()) else { continue };
+        if matches!(row_obj.row(), Row::SemanticGroup { .. } | Row::BatchGroup { .. }) {
+            tree_row.set_expanded(false);
+        }
     }
 }
 
@@ -641,40 +675,45 @@ fn delete_target(list_view: &gtk4::ListView) -> Option<UndoEntry> {
         .item()
         .and_then(|o| o.downcast::<RowObject>().ok())?;
     match row_obj.row() {
+        Row::SemanticGroup { .. } => None,
+        Row::BatchMime { mime, mime_handlers, .. } if !mime_handlers.is_empty() => {
+            Some(undo::revert_to_inherited(&mime, &mime_handlers))
+        }
+        Row::BatchMime { .. } => None,
         Row::Category { mime, handlers } if !handlers.is_empty() => {
             Some(undo::clear_category_default(&mime, &handlers))
         }
         Row::Exception { mime, handlers } => Some(undo::remove_exception(&mime, &handlers)),
-        Row::Handler {
-            mime,
-            desktop,
-            index,
-            ..
-        } if index > 0 => Some(undo::remove_handler(&mime, &desktop)),
+        Row::Handler { mime, desktop, index, .. } if index > 0 => {
+            Some(undo::remove_handler(&mime, &desktop))
+        }
         _ => None,
     }
 }
 
-// Returns (list_view, factory) so the caller can attach connect_bind after Wiring
-// is constructed — bind_row needs Wiring, and Wiring carries the list_view.
+// Returns (list_view, factory, tree_model). factory is returned so the caller can attach
+// connect_bind after Wiring is constructed — bind_row needs Wiring, and Wiring carries
+// the list_view. tree_model is needed to collapse Group rows after populate_root.
 fn build_list_view(
     root_store: gio::ListStore,
     state: Rc<RefCell<AppState>>,
-) -> (gtk4::ListView, gtk4::SignalListItemFactory) {
-    // passthrough=false, autoexpand=true: model items are RowObject directly, and categories auto-expand on first show.
+) -> (gtk4::ListView, gtk4::SignalListItemFactory, gtk4::TreeListModel) {
+    // passthrough=false, autoexpand=true: categories auto-expand; groups are collapsed
+    // back to default in populate_root after append.
     let tree_model =
         gtk4::TreeListModel::new(root_store, false, true, move |parent_obj: &glib::Object| {
             create_children(parent_obj, &state)
         });
 
-    let selection = gtk4::SingleSelection::new(Some(tree_model));
+    let selection = gtk4::SingleSelection::new(Some(tree_model.clone()));
 
     let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup(setup_row);
+    let right_col_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Horizontal);
+    factory.connect_setup(move |f, item| setup_row(f, item, &right_col_group));
 
     let list_view = gtk4::ListView::new(Some(selection), Some(factory.clone()));
     list_view.add_css_class("defaults-list");
-    (list_view, factory)
+    (list_view, factory, tree_model)
 }
 
 fn create_children(
@@ -684,6 +723,29 @@ fn create_children(
     let row_obj: &RowObject = parent_obj.downcast_ref()?;
     let row = row_obj.row();
     match row {
+        Row::SemanticGroup { static_children, .. } => {
+            if static_children.is_empty() {
+                return None;
+            }
+            let store = gio::ListStore::new::<RowObject>();
+            let s = state.borrow();
+            for node in static_children {
+                store.append(&RowObject::new(model::node_to_row(node, s.state())));
+            }
+            Some(store.upcast())
+        }
+        Row::BatchGroup { mimes, prior_handlers, display_handler, .. } => {
+            let store = gio::ListStore::new::<RowObject>();
+            for (i, mime) in mimes.iter().enumerate() {
+                let mime_handlers = prior_handlers.get(i).cloned().unwrap_or_default();
+                store.append(&RowObject::new(Row::BatchMime {
+                    mime: mime.clone(),
+                    mime_handlers,
+                    group_handler: display_handler.clone(),
+                }));
+            }
+            Some(store.upcast())
+        }
         Row::Category { mime, handlers } => {
             let store = gio::ListStore::new::<RowObject>();
             // Alternative handlers first (right below parent), then exceptions, then add button.
@@ -709,7 +771,7 @@ fn create_children(
                 Some(store.upcast())
             }
         }
-        Row::Handler { .. } | Row::AddException { .. } => None,
+        Row::BatchMime { .. } | Row::Handler { .. } | Row::AddException { .. } => None,
     }
 }
 
@@ -719,41 +781,43 @@ fn create_children(
 // Handler (secondary) rows reuse main_icon/main_label for the app icon+name and hide
 // the handler_* widgets. bind_row clears+repopulates actions per variant so old click
 // handlers from recycled rows don't leak.
-fn setup_row(_factory: &gtk4::SignalListItemFactory, item: &glib::Object) {
+fn setup_row(_factory: &gtk4::SignalListItemFactory, item: &glib::Object, right_col_group: &gtk4::SizeGroup) {
     let item: &gtk4::ListItem = item.downcast_ref().unwrap();
     let expander = gtk4::TreeExpander::new();
 
-    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
 
+    let left_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    left_box.set_hexpand(true);
     let main_icon = gtk4::Image::new();
     main_icon.set_pixel_size(24);
-    row_box.append(&main_icon);
-
+    left_box.append(&main_icon);
     let main_label = gtk4::Label::new(None);
     main_label.set_xalign(0.0);
-    row_box.append(&main_label);
+    left_box.append(&main_label);
+    row_box.append(&left_box);
 
-    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    row_box.append(&spacer);
-
+    let right_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    right_col_group.add_widget(&right_box);
+    let right_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    right_spacer.set_hexpand(true);
+    right_box.append(&right_spacer);
     let handler_icon = gtk4::Image::new();
     handler_icon.set_pixel_size(20);
-    row_box.append(&handler_icon);
-
+    right_box.append(&handler_icon);
     let handler_label = gtk4::Label::new(None);
     handler_label.set_xalign(0.0);
+    handler_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     handler_label.add_css_class("dim-label");
-    row_box.append(&handler_label);
-
+    right_box.append(&handler_label);
     let badge = gtk4::Label::new(None);
     badge.set_xalign(0.0);
     badge.add_css_class("dim-label");
     badge.add_css_class("mime-badge");
-    row_box.append(&badge);
-
+    right_box.append(&badge);
     let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
-    row_box.append(&actions);
+    right_box.append(&actions);
+    row_box.append(&right_box);
 
     expander.set_child(Some(&row_box));
     item.set_child(Some(&expander));
@@ -762,6 +826,7 @@ fn setup_row(_factory: &gtk4::SignalListItemFactory, item: &glib::Object) {
 struct RowWidgets {
     main_icon: gtk4::Image,
     main_label: gtk4::Label,
+    right_box: gtk4::Box,
     handler_icon: gtk4::Image,
     handler_label: gtk4::Label,
     badge: gtk4::Label,
@@ -769,30 +834,19 @@ struct RowWidgets {
 }
 
 fn unpack_row_widgets(expander: &gtk4::TreeExpander) -> Option<RowWidgets> {
-    let row_box = expander
-        .child()
-        .and_then(|c| c.downcast::<gtk4::Box>().ok())?;
-    let main_icon = row_box.first_child()?.downcast::<gtk4::Image>().ok()?;
+    let row_box = expander.child()?.downcast::<gtk4::Box>().ok()?;
+    let left_box = row_box.first_child()?.downcast::<gtk4::Box>().ok()?;
+    let main_icon = left_box.first_child()?.downcast::<gtk4::Image>().ok()?;
     let main_label = main_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
-    let spacer = main_label.next_sibling()?.downcast::<gtk4::Box>().ok()?;
-    let handler_icon = spacer.next_sibling()?.downcast::<gtk4::Image>().ok()?;
-    let handler_label = handler_icon
-        .next_sibling()?
-        .downcast::<gtk4::Label>()
-        .ok()?;
-    let badge = handler_label
-        .next_sibling()?
-        .downcast::<gtk4::Label>()
-        .ok()?;
+    let right_box = left_box.next_sibling()?.downcast::<gtk4::Box>().ok()?;
+    // first child of right_box is right_spacer (Box), skip it
+    let right_spacer = right_box.first_child()?.downcast::<gtk4::Box>().ok()?;
+    let handler_icon = right_spacer.next_sibling()?.downcast::<gtk4::Image>().ok()?;
+    let handler_label = handler_icon.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+    let badge = handler_label.next_sibling()?.downcast::<gtk4::Label>().ok()?;
     let actions = badge.next_sibling()?.downcast::<gtk4::Box>().ok()?;
-    Some(RowWidgets {
-        main_icon,
-        main_label,
-        handler_icon,
-        handler_label,
-        badge,
-        actions,
-    })
+    Some(RowWidgets { main_icon, main_label, right_box,
+                      handler_icon, handler_label, badge, actions })
 }
 
 fn clear_actions(actions: &gtk4::Box) {
@@ -837,13 +891,75 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
     clear_actions(&w.actions);
 
     // Reset all per-row-type CSS classes from the expander before rebinding.
-    for cls in ["row-category", "row-exception", "row-handler-alt", "row-add-exception"] {
+    for cls in ["row-semantic-group", "row-batch-group", "row-batch-mime", "row-category", "row-exception", "row-handler-alt", "row-add-exception", "row-alt-exception"] {
         expander.remove_css_class(cls);
     }
     w.main_label.remove_css_class("mime-category");
-    w.main_label.remove_css_class("mime-exception");
+    // Reset per-row state. left_box always stays visible (hiding it collapses flex space).
+    w.main_icon.set_visible(true);
+    w.main_label.set_visible(true);
+    for cls in ["alt-handler-last", "alt-handler-panel"] {
+        w.right_box.remove_css_class(cls);
+    }
 
     match row_obj.row() {
+        Row::SemanticGroup { name, icon_name, .. } => {
+            expander.add_css_class("row-semantic-group");
+            w.main_icon.set_icon_name(Some(&icon_name));
+            w.main_icon.set_visible(true);
+            w.main_label.set_text(&name);
+            w.main_label.set_visible(true);
+            w.main_label.add_css_class("mime-category");
+            w.handler_icon.set_visible(false);
+            w.handler_label.set_text("");
+            set_badge(&w.badge, "");
+            // No action buttons — pure container.
+        }
+        Row::BatchGroup { name, icon_name, mimes, prior_handlers, display_handler } => {
+            expander.add_css_class("row-batch-group");
+            w.main_icon.set_icon_name(Some(&icon_name));
+            w.main_icon.set_visible(true);
+            w.main_label.set_text(&name);
+            w.main_label.set_visible(true);
+            w.main_label.add_css_class("mime-category");
+            set_handler_inline(&w.handler_icon, &w.handler_label, display_handler.as_deref());
+            set_badge(&w.badge, "");
+            let (btn_icon, btn_tip) = if display_handler.is_some() {
+                ("document-edit-symbolic", "Change handler for all")
+            } else {
+                ("list-add-symbolic", "Set handler for all")
+            };
+            w.actions.append(&pick_btn(btn_icon, btn_tip, wiring, {
+                move |desktop| undo::set_batch_handler(&name, &mimes, &desktop, &prior_handlers)
+            }));
+        }
+        Row::BatchMime { mime, mime_handlers, group_handler } => {
+            expander.add_css_class("row-batch-mime");
+            set_mime_icon(&w.main_icon, &mime);
+            w.main_icon.set_visible(true);
+            w.main_label.set_text(&mime);
+            w.main_label.set_visible(true);
+            set_badge(&w.badge, "");
+            if mime_handlers.is_empty() {
+                set_handler_inherited(&w.handler_icon, &w.handler_label, group_handler.as_deref());
+                w.actions.append(&pick_btn("list-add-symbolic", "Set specific handler", wiring, {
+                    let mime_cl = mime.clone();
+                    move |desktop| undo::set_category_default(&mime_cl, &desktop, &[])
+                }));
+            } else {
+                set_handler_inline(&w.handler_icon, &w.handler_label, mime_handlers.first().map(String::as_str));
+                w.actions.append(&pick_btn("document-edit-symbolic", "Change handler", wiring, {
+                    let mime_cl = mime.clone();
+                    let handlers_cl = mime_handlers.clone();
+                    move |desktop| undo::set_category_default(&mime_cl, &desktop, &handlers_cl)
+                }));
+                w.actions.append(&simple_btn("user-trash-symbolic", "Revert to inherited", wiring, {
+                    let mime_cl = mime.clone();
+                    let handlers_cl = mime_handlers.clone();
+                    move || undo::revert_to_inherited(&mime_cl, &handlers_cl)
+                }));
+            }
+        }
         Row::Category { mime, handlers } => {
             expander.add_css_class("row-category");
             w.main_icon.set_visible(true);
@@ -954,13 +1070,21 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             mime,
             desktop,
             index,
-            ..
+            total,
         } => {
             expander.add_css_class("row-handler-alt");
-            let info = gio::DesktopAppInfo::new(&desktop);
-            // Left side empty — app appears on the right to match the default handler position.
+            if !mime.ends_with("/*") {
+                expander.add_css_class("row-alt-exception");
+            }
+            // Hide left-side content but keep left_box visible so it still fills flex space,
+            // which keeps right_box flush to the right edge.
             w.main_icon.set_visible(false);
-            w.main_label.set_text("");
+            w.main_label.set_visible(false);
+            w.right_box.add_css_class("alt-handler-panel");
+            if index == total - 1 {
+                w.right_box.add_css_class("alt-handler-last");
+            }
+            let info = gio::DesktopAppInfo::new(&desktop);
             if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
                 w.handler_icon.set_from_gicon(&g);
             } else {
@@ -971,7 +1095,6 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             w.handler_label
                 .set_text(&handler_display_name(&desktop, info.as_ref()));
             set_badge(&w.badge, "Alternative");
-            // create_children only emits index >= 1, but be defensive: index 0 has no action.
             if index > 0 {
                 let up_btn = make_action_btn("go-up-symbolic", "Promote handler");
                 {
@@ -1013,6 +1136,27 @@ fn bind_row(item: &glib::Object, wiring: &Wiring) {
             let wiring_cl = wiring.clone();
             btn.connect_clicked(move |_| open_add_exception_dialog(&wiring_cl, &category_mime));
             w.actions.append(&btn);
+        }
+    }
+}
+
+// Render the "Inherited" state for a GroupMime row with no specific override.
+// Shows the group handler's icon (if any) with the label "Inherited".
+fn set_handler_inherited(icon: &gtk4::Image, label: &gtk4::Label, group_handler: Option<&str>) {
+    match group_handler {
+        Some(d) => {
+            let info = gio::DesktopAppInfo::new(d);
+            if let Some(g) = info.as_ref().and_then(|a| a.icon()) {
+                icon.set_from_gicon(&g);
+            } else {
+                icon.set_icon_name(Some("applications-other-symbolic"));
+            }
+            icon.set_visible(true);
+            label.set_text("Inherited");
+        }
+        None => {
+            icon.set_visible(false);
+            label.set_text("(not set)");
         }
     }
 }
@@ -1099,8 +1243,7 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(
         // MIME label colours from theme palette.
-        ".mime-category { color: @accent_color; font-weight: bold; }\
-         .mime-exception { color: @success_color; }\
+        ".mime-category { font-weight: bold; }\
          \
          /* Pill badge: shape only, colour from theme currentColor. */\
          .mime-badge {\
@@ -1119,21 +1262,20 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
          .error-banner-icon { color: @error_color; }\
          \
          /* Tree row rhythm: group categories with their children. */\
-         .defaults-list row { min-height: 36px; }\
+         .defaults-list row { min-height: 36px; padding: 0; }\
+         .defaults-list .row-semantic-group {\
+             background-color: alpha(currentColor, 0.04);\
+         }\
+         .defaults-list .row-batch-mime {\
+             background-color: alpha(currentColor, 0.02);\
+         }\
+         .defaults-list .row-semantic-group + row { border-top: 1px solid alpha(currentColor, 0.10); }\
          .defaults-list .row-category {\
              padding-top: 6px;\
              border-top: 1px solid alpha(currentColor, 0.10);\
          }\
-         .defaults-list .row-exception {\
-             border-bottom: 1px solid alpha(currentColor, 0.06);\
-         }\
-         .defaults-list .row-handler-alt {\
-             background-color: alpha(@accent_color, 0.05);\
-             border-bottom: 1px solid alpha(currentColor, 0.06);\
-         }\
-         .defaults-list .row-add-exception {\
-             padding-bottom: 6px;\
-         }\
+         .defaults-list .row-exception { background-color: alpha(@success_color, 0.07); }\
+         .defaults-list .row-alt-exception .alt-handler-panel { background-color: alpha(@success_color, 0.07); }\
          \
          /* Ensure handler cards always have a visible border across all themes. */\
          .card {\
@@ -1143,6 +1285,17 @@ fn init_row_css(window: &gtk4::ApplicationWindow) {
          .new-handler-card {\
              border-style: dashed;\
              border-color: alpha(currentColor, 0.25);\
+         }\
+         \
+         /* Alternative handler panel — right-column only, accent bracket */\
+         .alt-handler-panel {\
+             border-left: 1.5px solid alpha(@accent_color, 0.28);\
+             margin-left: 1px;\
+         }\
+         .alt-handler-last {\
+             border-bottom: 1.5px solid alpha(@accent_color, 0.28);\
+             border-bottom-left-radius: 6px;\
+             border-bottom-right-radius: 6px;\
          }",
     );
     #[allow(deprecated)]

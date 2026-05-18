@@ -118,6 +118,35 @@ fn order_cmds(mime: &str, handlers: &[String]) -> Vec<HandlrCmd> {
     cmds
 }
 
+/// Remove a specific MIME override so it reverts to "inherited" (no handlr entry).
+pub(crate) fn revert_to_inherited(mime: &str, prior: &[String]) -> UndoEntry {
+    UndoEntry {
+        label: format!("revert {} to inherited", mime),
+        forward: vec![HandlrCmd::Unset { mime: mime.into() }],
+        inverse: inverse_for_set(mime, prior),
+    }
+}
+
+/// Set every MIME in `mimes` to `desktop` as a single undoable batch action.
+/// `prior_handlers[i]` is the current handler list for `mimes[i]` (used for inverse).
+pub(crate) fn set_batch_handler(
+    name: &str,
+    mimes: &[String],
+    desktop: &str,
+    prior_handlers: &[Vec<String>],
+) -> UndoEntry {
+    let forward: Vec<HandlrCmd> = mimes
+        .iter()
+        .map(|mime| HandlrCmd::Set { mime: mime.clone(), desktop: desktop.to_string() })
+        .collect();
+    let inverse: Vec<HandlrCmd> = mimes
+        .iter()
+        .zip(prior_handlers.iter())
+        .flat_map(|(mime, prior)| inverse_for_set(mime, prior))
+        .collect();
+    UndoEntry { label: format!("set {} to {}", name, desktop), forward, inverse }
+}
+
 pub(crate) fn push_bounded(stack: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
     if stack.len() >= UNDO_BOUND {
         stack.pop_front();
